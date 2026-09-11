@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.11.7](https://github.com/bman654/clodex/compare/v2.11.6...v2.11.7) (2026-09-11)
+
+
+### Bug Fixes
+
+* **oauth:** restore prompt caching for parallel subagents on ChatGPT models ([#211](https://github.com/bman654/clodex/issues/211)) ([9bd5205](https://github.com/bman654/clodex/commit/9bd5205fe87c45be0e8739f57928f64260819a8a))
+
 ## [2.11.6](https://github.com/bman654/clodex/compare/v2.11.5...v2.11.6) (2026-09-09)
 
 
