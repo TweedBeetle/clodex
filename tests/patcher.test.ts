@@ -588,8 +588,8 @@ describe('PATCH_TRANSFORMS_VERSION', () => {
       .join('\n');
     const digest = createHash('sha256').update(source).digest('hex');
     expect({ version: PATCH_TRANSFORMS_VERSION, digest }).toEqual({
-      version: 12,
-      digest: 'd9dff2594fc60dcae83fb34846c681ee75fb3b0d7f49e5c26cb1c3c415cbcc4c',
+      version: 13,
+      digest: 'bf5181358027f2ac0d6702e3dbaec275c854a170da9fa37780e8dfc25b90814a',
     });
   });
 });
@@ -1588,7 +1588,11 @@ function executeDefaultEffort(
  * options array, and a build that calls that array something other than `e` is
  * exactly where a hardcoded name becomes a ReferenceError inside the picker.
  */
-function executePicker(source: string, functionName = 'opts'): string[] {
+function executePicker(
+  source: string,
+  functionName = 'opts',
+  env: Record<string, string> = { HTTPS_PROXY: 'http://127.0.0.1:9' },
+): string[] {
   // Sliced by brace matching, not by line prefix: the decoy fixture puts a second
   // function on the same line as the real one.
   const start = source.indexOf(`function ${functionName}(`);
@@ -1609,7 +1613,21 @@ function executePicker(source: string, functionName = 'opts'): string[] {
     () => 'opus',
     (options: { value: string }[], name: string) => options.push({ value: name }),
   ) as (options: { value: string }[], ctx: unknown, current: unknown) => { value: string }[];
-  return build([], 'ctx', 'opus').map(option => option.value);
+  // The injected entries are gated on the process environment (ROUTED_REACHABLE), so the
+  // picker runs under an explicit one: bridged by default, as the tests that predate the gate
+  // assume, and whatever a gate test passes otherwise.
+  const keys = ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'ANTHROPIC_BASE_URL'];
+  const saved = Object.fromEntries(keys.map(k => [k, process.env[k]]));
+  for (const k of keys) delete process.env[k];
+  Object.assign(process.env, env);
+  try {
+    return build([], 'ctx', 'opus').map(option => option.value);
+  } finally {
+    for (const k of keys) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+  }
 }
 
 const CAPABILITY_GATES: Array<{
@@ -1665,8 +1683,10 @@ describe('patch script identity naming', () => {
     // PATCH 1: Agent-tool zod enum (the same enum agent/skill `model:` frontmatter
     // is validated against) gets "sol", never the canonical id.
     expect(out).toContain('.enum(["sonnet","opus","haiku","fable","sol","clodex:openai:mystery"]).optional().describe(');
-    // PATCH 3: known-alias validator list.
-    expect(out).toContain('["sonnet","opus","haiku","fable","opusplan","sol","clodex:openai:mystery"]');
+    // PATCH 3: known-alias validator list. Since transforms 14 the identities ride a concat
+    // gated on reachability rather than sitting in the literal.
+    expect(out).toContain('["sonnet","opus","haiku","fable","opusplan"].concat(/*ccpatch:reachable*/');
+    expect(out).toMatch(/\?\["sol","clodex:openai:mystery"\]:\[\]\/\*\/ccpatch:reachable\*\/\)/);
     // The aliased model's canonical id never appears as an identity in either
     // list (it survives only as an extra key in the context table).
     expect(out).not.toMatch(/\.enum\(\[[^\]]*gpt-5\.6-sol/);
@@ -2804,6 +2824,44 @@ describe('patch script identity naming', () => {
     // that one built-in before our entries; the unaliased model gets no picker
     // entry.
     expect(executePicker(result.content)).toEqual(['opus', 'sol']);
+  });
+
+  it('offers routed entries only in a process that can reach them (transforms 14)', () => {
+    const result = applyClodexPatches(CLAUDE_FIXTURE, config);
+    expect(pickerSite(result)?.status).toBe('OK');
+    expect(executePicker(result.content, 'opts', {}), 'no proxy, no base URL').toEqual(['opus']);
+    expect(executePicker(result.content, 'opts', { https_proxy: 'http://127.0.0.1:17646' }))
+      .toEqual(['opus', 'sol']);
+    expect(executePicker(result.content, 'opts', { ANTHROPIC_BASE_URL: 'http://127.0.0.1:8080' }),
+      'a local clodex gateway').toEqual(['opus', 'sol']);
+    expect(executePicker(result.content, 'opts', { ANTHROPIC_BASE_URL: 'https://opencode.ai/zen/go' }),
+      'a remote endpoint cannot serve clodex ids').toEqual(['opus']);
+  });
+
+  it('gates the known-alias list the same way, and a re-run does not stack the gate', () => {
+    const once = applyClodexPatches(CLAUDE_FIXTURE, config).content;
+    const twice = applyClodexPatches(once, config);
+    const markers = (src: string) => src.split('/*ccpatch:reachable*/').length - 1;
+    expect(markers(twice.content)).toBe(markers(once));
+    expect(twice.results.find(site => site.name.startsWith('PATCH 3'))?.status).toBe('SKIP');
+    const m = once.match(/var KNOWN=(\[[^\]]*\]\.concat\(\/\*ccpatch:reachable\*\/[\s\S]*?\/\*\/ccpatch:reachable\*\/\))/);
+    expect(m, 'gated list present').not.toBeNull();
+    const evalWith = (env: Record<string, string>): string[] => {
+      const keys = ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'ANTHROPIC_BASE_URL'];
+      const saved = Object.fromEntries(keys.map(k => [k, process.env[k]]));
+      for (const k of keys) delete process.env[k];
+      Object.assign(process.env, env);
+      try {
+        return Function(`return ${m![1]};`)() as string[];
+      } finally {
+        for (const k of keys) {
+          if (saved[k] === undefined) delete process.env[k];
+          else process.env[k] = saved[k];
+        }
+      }
+    };
+    expect(evalWith({})).toEqual(['sonnet', 'opus', 'haiku', 'fable', 'opusplan']);
+    expect(evalWith({ HTTPS_PROXY: 'http://127.0.0.1:17646' })).toContain('sol');
   });
 
   it.each([

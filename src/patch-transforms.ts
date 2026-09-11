@@ -86,8 +86,14 @@ import {
  * bumped because the rule above says a changed anchor is bumped — an install
  * patched by an older clodex is not wrong, but it was produced by a transform set
  * whose anchors are narrower, so it re-reads as stale rather than current.
+ *
+ * 13 — routed ids are gated on reachability (ROUTED_REACHABLE): the /model picker offers
+ * them, and the known-alias list accepts them without validation, only in a process bridged
+ * through a clodex proxy or pointed at a local clodex gateway. An unbridged session typing
+ * `/model <alias>` now meets Claude Code's own model validation instead of saving an
+ * unroutable id as the machine-wide default.
  */
-export const PATCH_TRANSFORMS_VERSION = 12;
+export const PATCH_TRANSFORMS_VERSION = 13;
 
 export interface PatchScriptModelEntry {
   alias?: string;
@@ -317,6 +323,25 @@ export function applyClodexPatches(source: string, config: PatchScriptModelConfi
     log('OK', name);
   }
 
+  /**
+   * A runtime expression, spliced into the bundle, that is true only in a process which can
+   * actually reach a routed model: one bridged through a clodex proxy (proxy env present), or
+   * pointed at a LOCAL clodex gateway through ANTHROPIC_BASE_URL. The /model picker (PATCH 5)
+   * and the known-alias list (PATCH 3) consult it. Without the gate an unbridged session both
+   * offers the ids and accepts `/model <alias>` without validation, and that command saves the
+   * alias as the machine-wide default — after which every unbridged launch fails with "There's
+   * an issue with the selected model". Gated, the same command goes through Claude Code's own
+   * model validation, which rejects an id it cannot reach instead of saving it.
+   * The Agent-tool enum (PATCH 1) is deliberately NOT gated: it also validates subagent and
+   * skill frontmatter at load, and a routed subagent requested from an unbridged session
+   * already fails loudly at the API.
+   */
+  const ROUTED_REACHABLE =
+    '(function(){var e=(typeof process!=="undefined"&&process.env)||{};' +
+    'return!!(e.https_proxy||e.HTTPS_PROXY||/^https?:\\/\\/(127\\.0\\.0\\.1|localhost|\\[::1\\])(:|\\/|$)/i.test(e.ANTHROPIC_BASE_URL||""))})()';
+  const REACHABLE_OPEN = '/*ccpatch:reachable*/';
+  const REACHABLE_CLOSE = '/*/ccpatch:reachable*/';
+
   /** Insert missing identities just before the closing bracket of a JS array literal string. */
   function extendAliasArray(arrLiteral: string): string {
     const toAdd = IDENTITIES.filter((a) => !new RegExp('"' + reEsc(a) + '"').test(arrLiteral));
@@ -350,10 +375,19 @@ export function applyClodexPatches(source: string, config: PatchScriptModelConfi
   // tolerates new built-ins being added in the middle. Appending our identities
   // makes them recognized as first-class aliases everywhere the gate runs.
   // ---------------------------------------------------------------------------
+  // Gated (transforms 14): the identities ride a `.concat(...)` that is evaluated against
+  // ROUTED_REACHABLE when the module loads, instead of sitting in the literal. The optional
+  // second group re-matches a previous run's concat, so a re-run rebuilds an identical one
+  // (a SKIP) rather than stacking a second.
   applyOnce(
     'PATCH 3: known-alias validator list',
-    /\["sonnet","opus","haiku","fable"(?:,"[^"]+")*,"opusplan"(?:,"[^"]+")*\]/,
-    (m) => extendAliasArray(m),
+    /(\["sonnet","opus","haiku","fable"(?:,"[^"]+")*,"opusplan"(?:,"[^"]+")*\])(\.concat\(\/\*ccpatch:reachable\*\/[\s\S]*?\/\*\/ccpatch:reachable\*\/\))?/,
+    (_m, arr) => {
+      const toAdd = IDENTITIES.filter((a) => !new RegExp('"' + reEsc(a) + '"').test(arr!));
+      return toAdd.length === 0
+        ? arr!
+        : arr! + '.concat(' + REACHABLE_OPEN + ROUTED_REACHABLE + '?[' + toAdd.map(q).join(',') + ']:[]' + REACHABLE_CLOSE + ')';
+    },
     { required: true, noopIsSkip: true }
   );
 
@@ -456,9 +490,10 @@ export function applyClodexPatches(source: string, config: PatchScriptModelConfi
       )
       .join(',');
     /** The append snippet, bound to whatever this build named the options array. */
+    // Gated (transforms 14): offered only where ROUTED_REACHABLE holds — see its comment.
     const injectInto = (options: string) =>
       missing.length
-        ? '[' + entries + '].forEach(function(_o){if(!' + options + '.some(function(_i){return _i.value===_o.value}))' + options + '.push(_o)});'
+        ? 'if(' + ROUTED_REACHABLE + ')[' + entries + '].forEach(function(_o){if(!' + options + '.some(function(_i){return _i.value===_o.value}))' + options + '.push(_o)});'
         : '';
     const pickerSite = 'PATCH 5: model picker options';
     // MUST stay a prefix of the anchor below — that is what makes the count mean
