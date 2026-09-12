@@ -2177,12 +2177,26 @@ function observeQuotaEvent(
   // `codex.response.metadata` only interests us when it actually carries meter
   // state; it is a frequent frame otherwise.
   if (type === 'codex.response.metadata' && limits === undefined) return;
-  let serialized: string | undefined;
-  try {
-    serialized = JSON.stringify(limits);
-  } catch {
-    serialized = undefined;
-  }
+  // The sibling ledgers ride the SAME frame: `additional_rate_limits` is where a
+  // per-model allowance (a reserve, a preview-model bucket) reports, and `credits`
+  // is where overage sits. Capturing only `rate_limits` would answer "which window"
+  // while leaving "did this request touch the reserve instead" unanswerable from a
+  // record that had the answer in it.
+  const bounded = (value: unknown): { value?: unknown; bytes?: number } => {
+    let serialized: string | undefined;
+    try {
+      serialized = JSON.stringify(value);
+    } catch {
+      return {};
+    }
+    if (serialized === undefined) return {};
+    return serialized.length <= 8000
+      ? { value, bytes: serialized.length }
+      : { bytes: serialized.length };
+  };
+  const rate = bounded(limits);
+  const additional = bounded(record.additional_rate_limits);
+  const credits = bounded(record.credits);
   sink({
     event: 'ws_rate_limits',
     connectionId: entry.debugId,
@@ -2191,8 +2205,10 @@ function observeQuotaEvent(
     upstreamEventType: boundedDiagnosticIdentifier(type),
     fieldsPresent: Object.keys(record).slice(0, 24),
     // Bounded, but generous: this is the payload the whole exercise exists to see.
-    rateLimits: serialized !== undefined && serialized.length <= 8000 ? limits : undefined,
-    rateLimitsBytes: serialized?.length,
+    rateLimits: rate.value,
+    rateLimitsBytes: rate.bytes,
+    additionalRateLimits: additional.value,
+    credits: credits.value,
     meteredLimitName: boundedDiagnosticIdentifier(record.metered_limit_name),
     limitName: boundedDiagnosticIdentifier(record.limit_name),
     planType: boundedDiagnosticIdentifier(record.plan_type),
