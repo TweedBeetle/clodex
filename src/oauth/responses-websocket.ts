@@ -224,6 +224,15 @@ interface ConnectionEntry {
   canonicalToolDefaultsId?: string;
   options: Required<Pick<ResponsesWebSocketFetchOptions, 'hardTtlMs' | 'idleTtlMs' | 'nurseryIdleTtlMs' | 'maxConnections' | 'now'>>;
   debug: (message: string) => void;
+  /**
+   * Connection-scoped diagnostic sink. `RequestContext.emitDiagnostic` only exists
+   * while a request is in flight, and the upstream account signals we care about
+   * (the upgrade response's headers, and `codex.rate_limits` frames that can arrive
+   * between or after responses) are properties of the CONNECTION. Without this they
+   * are observed by nobody: the message handler returns before parsing when there is
+   * no active context.
+   */
+  connectionDiagnostic?: (event: { event: string } & Record<string, unknown>) => void;
 }
 
 // A Claude session partition can have multiple valid conversation heads at
@@ -1799,8 +1808,12 @@ function transportReplaySafe(ctx: RequestContext): boolean {
 
 function handleSocketMessage(entry: ConnectionEntry, data: RawData): void {
   const ctx = entry.current;
-  if (!ctx || ctx.closed) return;
   const text = Array.isArray(data) ? Buffer.concat(data).toString('utf8') : data.toString('utf8');
+  if (!ctx || ctx.closed) {
+    // An account-meter frame between or after responses used to die right here.
+    observeIdleFrame(entry, text);
+    return;
+  }
   ctx.frameCount += 1;
   if (ctx.transportRetryPending) {
     ctx.transportRetryPending = false;
@@ -1820,6 +1833,7 @@ function handleSocketMessage(entry: ConnectionEntry, data: RawData): void {
   }
 
   const type = eventType(event);
+  if (isQuotaEvent(type)) observeQuotaEvent(entry, event, type, 'during_response');
   trackReasoningProtocol(entry, ctx, event, type);
   captureOutput(ctx, event);
   if (type === 'response.completed') {
@@ -2134,6 +2148,87 @@ function numericRetryAfterHeader(value: string | string[] | undefined): number |
     : undefined;
 }
 
+/**
+ * Response-header families that have ever carried the Codex account meter.
+ * Matched case-insensitively on the header NAME only; values are recorded as the
+ * raw strings the server sent, because the whole point is to find out whether the
+ * meter has precision the integer `/wham/usage` percentage throws away.
+ */
+const QUOTA_HEADER_PATTERN = /^x-codex-|rate-?limit|used-?percent|resets?-at|window-minutes/i;
+
+/** Upstream event types that carry account-meter state rather than response data. */
+function isQuotaEvent(type: string | undefined): boolean {
+  return type === 'codex.rate_limits' || type === 'codex.response.metadata';
+}
+
+/**
+ * Record what an upstream frame says about the ACCOUNT's allowance, verbatim.
+ *
+ * Native Codex parses `codex.rate_limits` off this same socket
+ * (`codex-rs/codex-api/src/endpoint/responses_websocket.rs` → `parse_rate_limit_event`
+ * at `rust-v0.154.0`), so the protocol carries the signal even though clodex has
+ * never looked at it. Nothing here changes inference: it observes and returns.
+ *
+ * Two rules the measurement depends on:
+ *  - values are passed through UNCOASTED — no `?? 0`, no Number() coercion — so a
+ *    fractional percent survives and a missing field stays distinguishable from a
+ *    measured zero (`fieldsPresent` says which keys actually existed);
+ *  - `phase` records whether the frame arrived inside a response or between them.
+ *    An idle frame belongs to the connection; attributing its debit to the last
+ *    response would invent a number.
+ */
+function observeQuotaEvent(
+  entry: ConnectionEntry,
+  event: unknown,
+  type: string | undefined,
+  phase: 'during_response' | 'idle',
+): void {
+  const sink = entry.connectionDiagnostic;
+  if (!sink) return;
+  if (!event || typeof event !== 'object') return;
+  const record = event as Record<string, unknown>;
+  const limits = record.rate_limits;
+  // `codex.response.metadata` only interests us when it actually carries meter
+  // state; it is a frequent frame otherwise.
+  if (type === 'codex.response.metadata' && limits === undefined) return;
+  let serialized: string | undefined;
+  try {
+    serialized = JSON.stringify(limits);
+  } catch {
+    serialized = undefined;
+  }
+  sink({
+    event: 'ws_rate_limits',
+    connectionId: entry.debugId,
+    generation: entry.generation,
+    phase,
+    upstreamEventType: boundedDiagnosticIdentifier(type),
+    fieldsPresent: Object.keys(record).slice(0, 24),
+    // Bounded, but generous: this is the payload the whole exercise exists to see.
+    rateLimits: serialized !== undefined && serialized.length <= 8000 ? limits : undefined,
+    rateLimitsBytes: serialized?.length,
+    meteredLimitName: boundedDiagnosticIdentifier(record.metered_limit_name),
+    limitName: boundedDiagnosticIdentifier(record.limit_name),
+    planType: boundedDiagnosticIdentifier(record.plan_type),
+  });
+}
+
+/** Parse a frame that arrived with no request in flight, purely to observe quota. */
+function observeIdleFrame(entry: ConnectionEntry, text: string): void {
+  if (!entry.connectionDiagnostic) return;
+  let event: unknown;
+  try {
+    event = JSON.parse(text);
+  } catch {
+    return;
+  }
+  const type = eventType(event) ?? (event && typeof event === 'object'
+    ? boundedDiagnosticIdentifier((event as Record<string, unknown>).kind)
+    : undefined);
+  if (!isQuotaEvent(type)) return;
+  observeQuotaEvent(entry, event, type, 'idle');
+}
+
 function createConnection(
   WebSocket: WebSocketConstructor,
   wsUrl: string,
@@ -2144,6 +2239,7 @@ function createConnection(
   debug: ConnectionEntry['debug'],
   /** Optional HTTP(S)_PROXY CONNECT-tunnel agent (see src/outbound-proxy.ts). */
   agent?: import('node:http').Agent,
+  connectionDiagnostic?: ConnectionEntry['connectionDiagnostic'],
 ): ConnectionEntry {
   const now = options.now();
   const socket = new WebSocket(wsUrl, agent ? { headers, agent } : { headers });
@@ -2160,6 +2256,7 @@ function createConnection(
     inFlight: false,
     options,
     debug,
+    connectionDiagnostic,
   };
   if (persistent && key) registerEntry(entry);
   debug(
@@ -2173,6 +2270,29 @@ function createConnection(
     (socket as unknown as { _socket?: { unref?: () => void } })._socket?.unref?.();
     const ctx = entry.current;
     if (ctx && !ctx.closed) sendContext(entry, ctx);
+  });
+  // A SUCCESSFUL upgrade (HTTP 101) also carries response headers, and `ws` exposes
+  // them — `@types/ws` declares `upgrade(IncomingMessage)`. clodex only ever listened
+  // for the FAILED upgrade below, so any account-meter header on the successful one
+  // has been discarded since the transport was written. Connection-time metadata, not
+  // a per-turn debit: never reconnect to refresh it, or the cache path under test moves.
+  socket.on('upgrade', (response: import('node:http').IncomingMessage) => {
+    const sink = entry.connectionDiagnostic;
+    if (!sink) return;
+    const headers = response.headers ?? {};
+    const quotaHeaders: Record<string, unknown> = {};
+    for (const [name, value] of Object.entries(headers)) {
+      if (QUOTA_HEADER_PATTERN.test(name)) quotaHeaders[name] = value;
+    }
+    sink({
+      event: 'ws_upgrade_headers',
+      connectionId: entry.debugId,
+      generation: entry.generation,
+      statusCode: response.statusCode,
+      headerCount: Object.keys(headers).length,
+      quotaHeaderCount: Object.keys(quotaHeaders).length,
+      quotaHeaders,
+    });
   });
   socket.on('unexpected-response', (_request, response) => {
     const statusCode = response.statusCode ?? 502;
@@ -2748,6 +2868,14 @@ export function createResponsesWebSocketFetch(
       evictions,
     }, diagnosticCorrelation);
 
+    // Connection-scoped sink: deliberately NOT bound to this request's correlation.
+    // `emitDiagnostic` reads the async-local store at call time, so a frame observed
+    // inside a response carries that response's ids and an idle one carries none —
+    // which is the distinction the measurement rests on.
+    const connectionDiagnostic: ConnectionEntry['connectionDiagnostic'] = options.onDiagnostic
+      ? event => emitDiagnostic(options, event)
+      : undefined;
+
     let activeContext: RequestContext | undefined;
     const stream = new ReadableStream<Uint8Array>({
       start(controller) {
@@ -2783,6 +2911,7 @@ export function createResponsesWebSocketFetch(
             resolvedOptions,
             debug,
             proxyAgent,
+            connectionDiagnostic,
           ),
         };
         activeContext = ctx;
@@ -2796,6 +2925,7 @@ export function createResponsesWebSocketFetch(
           resolvedOptions,
           debug,
           proxyAgent,
+          connectionDiagnostic,
         );
         dispatchContext(entry, ctx);
 
