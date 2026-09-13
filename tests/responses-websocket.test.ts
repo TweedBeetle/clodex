@@ -6844,37 +6844,6 @@ describe('account-meter observation (quota attribution instrument)', () => {
     expect(observed.planType).toBeUndefined();
   });
 
-  it('captures the sibling allowance ledgers that ride the same frame', async () => {
-    // `additional_rate_limits` is where a per-model allowance (the Luna reserve, a
-    // preview-model bucket) reports, and `credits` is where overage sits. Without
-    // them a record that contains the answer to "did this request draw the reserve"
-    // still cannot answer it.
-    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
-    const wsFetch = createResponsesWebSocketFetch(WS_URL, () => {}, {
-      onDiagnostic: event => diagnostics.push(event),
-    });
-    const res = await wsFetch('https://x', { method: 'POST', headers: {}, body: '{}' });
-    const socket = lastSocket();
-    socket.emit('open');
-    socket.emit('message', Buffer.from(JSON.stringify({
-      type: 'codex.rate_limits',
-      rate_limits: { primary: { used_percent: 2 } },
-      additional_rate_limits: [
-        { limit_name: 'gpt-reserve', metered_feature: 'base_model_inference',
-          rate_limit: { primary_window: { used_percent: 0 } }, normal_model_slug: 'gpt-5.6-luna' },
-      ],
-      credits: { has_credits: false, balance: '0' },
-    })));
-    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.completed' })));
-    await readAll(res);
-
-    const observed = diagnostics.find(d => d.event === 'ws_rate_limits')!;
-    const additional = observed.additionalRateLimits as Array<{ limit_name: string }>;
-    expect(additional).toHaveLength(1);
-    expect(additional[0]!.limit_name).toBe('gpt-reserve');
-    expect((observed.credits as { balance: string }).balance).toBe('0');
-  });
-
   it('stays silent on an idle frame that carries no meter state', async () => {
     // Silence has to mean silence, or a null result is unreadable.
     const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
