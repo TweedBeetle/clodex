@@ -2300,8 +2300,9 @@ function boundedLedger(value: unknown): { value?: unknown; bytes?: number } {
  *    fractional percent survives and a missing field stays distinguishable from a
  *    measured zero (`fieldsPresent` says which keys actually existed);
  *  - `phase` records whether the frame arrived inside a response or between them.
- *    An idle frame belongs to the connection; attributing its debit to the last
- *    response would invent a number.
+ *    `idle` only says no request was in flight when the frame arrived; the last
+ *    response may well have caused it (`response.completed` clears `current`
+ *    before a trailing meter frame lands), but clodex cannot safely attribute it.
  *
  * `emit` decides the correlation: the in-flight request's sink during a response,
  * the uncorrelated connection sink while idle.

@@ -637,8 +637,9 @@ this same connection (`codex-rs/codex-api/src/endpoint/responses_websocket.rs`,
 `ws_rate_limits` event:
 
 - `phase` is `during_response` when the frame arrived while a request was in flight and `idle` when
-  it did not. Keep the two apart when attributing a debit: an idle frame's change belongs to no
-  particular response.
+  it did not. `idle` means clodex cannot safely attribute the frame to a request, not that no
+  response caused it: `response.completed` clears the in-flight request on a persistent head, so a
+  meter frame sent right after completion by that very response is still labeled `idle`.
 - Correlation follows the phase. A `during_response` frame carries the in-flight request's
   `requestId` and `claudeSessionId`; an `idle` frame carries neither. Socket callbacks run in the
   async context of the request that created the socket, so reading the ambient diagnostic context

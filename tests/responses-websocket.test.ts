@@ -6863,7 +6863,7 @@ describe('usage-limit diagnostics', () => {
     const res = await wsFetch('https://x', { method: 'POST', headers: {}, body: '{}' });
     const socket = lastSocket();
     socket.emit('open');
-    socket.emit('message', Buffer.from(JSON.stringify({
+    const frame = {
       type: 'codex.rate_limits',
       rate_limits: { primary: { used_percent: 2 } },
       // Keyed by allowance name, as live frames send it.
@@ -6878,7 +6878,8 @@ describe('usage-limit diagnostics', () => {
       code_review_rate_limits: { allowed: true, primary: { used_percent: 4 } },
       credits: null,
       promo: { active: false },
-    })));
+    };
+    socket.emit('message', Buffer.from(JSON.stringify(frame)));
     socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.completed' })));
     await readAll(res);
 
@@ -6890,6 +6891,31 @@ describe('usage-limit diagnostics', () => {
     expect('credits' in observed).toBe(true);
     expect((observed.codeReviewRateLimits as { primary: { used_percent: number } }).primary.used_percent).toBe(4);
     expect(observed.promo).toEqual({ active: false });
+
+    // Every ledger's size is the size of THAT ledger, and the event names the
+    // socket the head decision for this request created. A swapped byte count
+    // or a stale connection id would otherwise pass the field-by-field checks.
+    const size = (value: unknown) => Buffer.byteLength(JSON.stringify(value));
+    const decision = diagnostics.find(d => d.event === 'ws_head_decision')!;
+    expect(observed).toMatchObject({
+      connectionId: decision.createdConnectionId,
+      generation: decision.createdGeneration,
+      phase: 'during_response',
+      upstreamEventType: 'codex.rate_limits',
+      fieldCount: 6,
+      fieldsPresent: ['type', 'rate_limits', 'additional_rate_limits', 'code_review_rate_limits', 'credits', 'promo'],
+      rateLimits: frame.rate_limits,
+      rateLimitsBytes: size(frame.rate_limits),
+      additionalRateLimits: frame.additional_rate_limits,
+      additionalRateLimitsBytes: size(frame.additional_rate_limits),
+      codeReviewRateLimits: frame.code_review_rate_limits,
+      codeReviewRateLimitsBytes: size(frame.code_review_rate_limits),
+      credits: null,
+      creditsBytes: size(null),
+      promo: frame.promo,
+      promoBytes: size(frame.promo),
+    });
+    expect(observed.planType).toBeUndefined();
   });
 
   it('stays silent on an idle frame that carries no meter state', async () => {
