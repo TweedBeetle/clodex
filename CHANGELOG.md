@@ -1,5 +1,19 @@
 # Changelog
 
+## [2.13.1](https://github.com/bman654/clodex/compare/v2.13.0...v2.13.1) (2026-09-14)
+
+
+### Bug Fixes
+
+* **providers:** keep Node 26 requests working after a connection drops ([#239](https://github.com/bman654/clodex/issues/239)) ([59810d0](https://github.com/bman654/clodex/commit/59810d03a87d27cf274aca8cee55e95e53cf474a))
+
+## [2.13.0](https://github.com/bman654/clodex/compare/v2.12.2...v2.13.0) (2026-09-14)
+
+
+### Features
+
+* **oauth:** keep parallel conversations cached instead of dropping them at a fixed limit ([#236](https://github.com/bman654/clodex/issues/236)) ([acade46](https://github.com/bman654/clodex/commit/acade463f315dd3a5f2969f666caf613bb335f4e)), closes [#222](https://github.com/bman654/clodex/issues/222)
+
 ## [2.12.2](https://github.com/bman654/clodex/compare/v2.12.1...v2.12.2) (2026-09-13)
 
 
