@@ -7,7 +7,7 @@ export const OPENCODE_GO_PROVIDER_NAME = 'OpenCode Go';
 export const OPENCODE_GO_COMPLETIONS_BASE_URL = 'https://opencode.ai/zen/go/v1';
 export const OPENCODE_GO_ANTHROPIC_BASE_URL = 'https://opencode.ai/zen/go';
 export const OPENCODE_GO_SOURCE = 'https://models.dev/api.json';
-export const OPENCODE_GO_SOURCE_FETCHED_AT = '2026-09-13T16:46:07.450Z';
+export const OPENCODE_GO_SOURCE_FETCHED_AT = '2026-09-17T20:15:19.938Z';
 
 type OpenCodeGoModel = Pick<CachedModel, 'id' | 'name'>
   & Partial<Omit<CachedModel, 'id' | 'name'>>;
