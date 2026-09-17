@@ -51,6 +51,10 @@ const TRANSPORTS = Object.assign(Object.create(null), {
   'mimo-v2.5-pro': 'openai-completions',
   'minimax-m2.7': 'openai-completions',
   'minimax-m3': 'anthropic-messages',
+  // Measured 2026-09-17 against the live Go endpoint: 200 on /v1/messages,
+  // 500 on /v1/chat/completions and /v1/responses. models.dev publishes
+  // provider.npm '@ai-sdk/anthropic' for it, agreeing.
+  'union-alpha': 'anthropic-messages',
   'qwen3.6-plus': 'openai-completions',
   'qwen3.7-max': 'anthropic-messages',
   'qwen3.7-plus': 'anthropic-messages',

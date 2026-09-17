@@ -47,11 +47,11 @@ describe('OpenCode Go catalog', () => {
 
     expect(OPENCODE_GO_SOURCE).toBe('https://models.dev/api.json');
     expect(new Date(OPENCODE_GO_SOURCE_FETCHED_AT).toISOString()).toBe(OPENCODE_GO_SOURCE_FETCHED_AT);
-    expect(models).toHaveLength(18);
+    expect(models).toHaveLength(19);
     expect(new Set(ids).size).toBe(models.length);
     expect(ids).not.toContain('grok-4.5');
     expect(new Set(models.map(model => model.modelFormat))).toEqual(new Set(['anthropic', 'openai']));
-    expect(models.filter(model => model.modelFormat === 'anthropic')).toHaveLength(5);
+    expect(models.filter(model => model.modelFormat === 'anthropic')).toHaveLength(6);
     expect(models.filter(model => model.modelFormat === 'openai')).toHaveLength(13);
   });
 
