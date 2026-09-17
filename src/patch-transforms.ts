@@ -87,7 +87,7 @@ import {
  * patched by an older clodex is not wrong, but it was produced by a transform set
  * whose anchors are narrower, so it re-reads as stale rather than current.
  */
-export const PATCH_TRANSFORMS_VERSION = 12;
+export const PATCH_TRANSFORMS_VERSION = 13;
 
 export interface PatchScriptModelEntry {
   alias?: string;
@@ -376,14 +376,32 @@ export function applyClodexPatches(source: string, config: PatchScriptModelConfi
   // edit) tops up cleanly rather than duplicating cases.
   // ---------------------------------------------------------------------------
   {
-    const missing = ALIASES.filter((a) => !new RegExp('case' + reEsc(q(a)) + ':return').test(js));
+    // The injection site, and the region the presence test reads. `case"best":{`
+    // is unique in the bundle; the region runs from it to the switch's own
+    // `default:return`, which is where an injected case and any native sibling
+    // case live. The cases BEFORE `case"best"` are the reserved tier names,
+    // which an alias cannot take, so the region need not reach back past it.
+    const RESOLVER_ANCHOR = /(case"best":\{[^{}]*\})/;
+    const RESOLVER_SWITCH = /case"best":\{[^{}]*\}[\s\S]{0,2000}?default:return/;
+    // Skipping an alias the bundle already resolves is deliberate — a native
+    // `case"sol":return "native";` must win rather than be shadowed by an
+    // injected duplicate. But `case"<word>":return` is not a rare string, and
+    // the switch it sits in is what decides whether it means anything here:
+    // zod's schema walker ships `case"union":return ...`, so an alias named
+    // `union` read as natively resolved. Its case was dropped silently, its
+    // built-in postcondition could then not be captured, and the whole LOCAL
+    // PATCH SET was abandoned — one unlucky alias NAME cost every local patch.
+    const resolver = js.match(RESOLVER_SWITCH)?.[0] ?? '';
+    const missing = ALIASES.filter(
+      (a) => !new RegExp('case' + reEsc(q(a)) + ':return').test(resolver),
+    );
     const cases = missing.map((a) => 'case' + q(a) + ':return ' + q(a) + ';').join('');
     if (ALIASES.length === 0) {
       log('SKIP', 'PATCH 6: alias resolver switch', 'no aliases configured');
     } else {
       applyOnce(
         'PATCH 6: alias resolver switch',
-        /(case"best":\{[^{}]*\})/,
+        RESOLVER_ANCHOR,
         (m) => m + cases,
         { required: true, noopIsSkip: true }
       );

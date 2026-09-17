@@ -969,6 +969,37 @@ describe('runPatchCommand local patches', () => {
     expect(logs.join('\n')).toMatch(/FAIL\s+LOCAL PATCH SET.*postconditions/);
   });
 
+  it('injects an alias whose name collides with an unrelated switch elsewhere in the bundle', async () => {
+    // The regression: the presence test read the WHOLE bundle, so an alias
+    // named after any word another switch already branches on read as
+    // natively resolved. zod's schema walker ships `case"union":return ...`,
+    // which is where this was found — one unlucky alias NAME silently lost its
+    // case, and the missing case then cost every local patch, because its
+    // built-in postcondition could not be captured.
+    const bundle = `${PRISTINE_BUNDLE}\nfunction walk(d){switch(d.type){case"union":return d.options.map(walk);default:return d}}`;
+    const real = installClaude('2.1.220', bundle);
+    mkdirSync(clodexHome, { recursive: true });
+    writeFileSync(join(clodexHome, 'config.json'), JSON.stringify({
+      favoriteModels: [{ providerId: 'opencode-go', modelId: 'union-alpha' }],
+      modelAliases: [{ name: 'union', providerId: 'opencode-go', modelId: 'union-alpha' }],
+    }));
+    writeFileSync(join(clodexHome, 'local-patches.mjs'), `
+      export default [{
+        id: 'runs-alongside',
+        apply(source, { marker }) { return source + '\\n' + marker; },
+      }];
+    `);
+
+    expect(await runPatchCommand({ localPatches: true })).toBe(0);
+    // The alias reaches the resolver...
+    expect(bundleOf(real)).toContain('case"union":return "union";');
+    // ...the unrelated switch is untouched...
+    expect(bundleOf(real)).toContain('case"union":return d.options.map(walk);');
+    // ...and the local patch set still runs, which is what the dropped case cost.
+    expect(bundleOf(real)).toContain('/*clodex-local:runs-alongside*/');
+    expect(logs.join('\n')).not.toMatch(/FAIL\s+LOCAL PATCH SET/);
+  });
+
   it('allows a local edit adjacent to an intact built-in postcondition', async () => {
     const real = installClaude('2.1.220');
     writeFileSync(join(clodexHome, 'local-patches.mjs'), `
