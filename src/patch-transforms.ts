@@ -93,7 +93,7 @@ import {
  * `/model <alias>` now meets Claude Code's own model validation instead of saving an
  * unroutable id as the machine-wide default.
  */
-export const PATCH_TRANSFORMS_VERSION = 13;
+export const PATCH_TRANSFORMS_VERSION = 14;
 
 export interface PatchScriptModelEntry {
   alias?: string;
@@ -409,15 +409,38 @@ export function applyClodexPatches(source: string, config: PatchScriptModelConfi
   // Only aliases not already present are inserted, so a rerun (or a config
   // edit) tops up cleanly rather than duplicating cases.
   // ---------------------------------------------------------------------------
+  // The injection site, and the region the presence test reads. `case"best":{`
+  // is unique in the bundle; the region runs from it to the switch's own
+  // `default:return`, which is where injected cases and any native sibling
+  // case live. Cases BEFORE `case"best"` are the reserved tier names
+  // (opus/sonnet/haiku/fable/opusplan), which an alias cannot take, so the
+  // region does not need to reach back past it.
+  const RESOLVER_ANCHOR = /(case"best":\{[^{}]*\})/;
+  const RESOLVER_SWITCH = /case"best":\{[^{}]*\}[\s\S]{0,2000}?default:return/;
+
   {
-    const missing = ALIASES.filter((a) => !new RegExp('case' + reEsc(q(a)) + ':return').test(js));
+    // The presence test is scoped to the RESOLVER, not to the whole bundle.
+    // Skipping an alias the bundle already resolves is deliberate — a native
+    // `case"sol":return "native";` must win rather than be shadowed by an
+    // injected duplicate — but `case"<word>":return` is not a rare string, and
+    // the switch statement it belongs to is what decides whether it means
+    // anything here: zod's own schema walker ships `case"union":return ...`,
+    // which made an alias named `union` read as natively handled. PATCH 6 then
+    // dropped it silently, its built-in postcondition could not be captured,
+    // and the whole LOCAL PATCH SET was abandoned — so one unlucky alias NAME
+    // cost every local patch, with the patch summary the only sign. Measured
+    // 2026-09-17 on Claude Code 2.1.274.
+    const resolver = js.match(RESOLVER_SWITCH)?.[0] ?? '';
+    const missing = ALIASES.filter(
+      (a) => !new RegExp('case' + reEsc(q(a)) + ':return').test(resolver),
+    );
     const cases = missing.map((a) => 'case' + q(a) + ':return ' + q(a) + ';').join('');
     if (ALIASES.length === 0) {
       log('SKIP', 'PATCH 6: alias resolver switch', 'no aliases configured');
     } else {
       applyOnce(
         'PATCH 6: alias resolver switch',
-        /(case"best":\{[^{}]*\})/,
+        RESOLVER_ANCHOR,
         (m) => m + cases,
         { required: true, noopIsSkip: true }
       );
