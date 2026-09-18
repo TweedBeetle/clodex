@@ -539,7 +539,12 @@ describe('relayAnthropicMessages anchor-safe message ids', () => {
     'event: message_stop',
     'data: {"type":"message_stop"}',
     '',
+    '',
   ].join('\n');
+
+  /** The data payloads of the complete (blank-line-terminated) events in a stream. */
+  const events = (body: string) => body.split('\n\n').filter(block => block.trim() !== '')
+    .map(block => JSON.parse(block.split('\n').filter(line => line.startsWith('data:')).map(line => line.slice(5)).join('\n')) as { type: string; message?: { id: string } });
 
   async function relay(stream: boolean, upstreamBody: string, options: Parameters<typeof relayAnthropicMessages>[5]) {
     vi.stubGlobal('fetch', vi.fn(async () => new Response(upstreamBody, {
@@ -557,8 +562,9 @@ describe('relayAnthropicMessages anchor-safe message ids', () => {
 
   it('replaces a streamed msg_ id', async () => {
     const body = await relay(true, sse('msg_4c571f9f-eb72-47d9-94fb-36288b9ba3c6'), { anchorSafeMessageIds: true });
-    expect(/"id":"([^"]+)"/.exec(body)?.[1]).toMatch(/^clodex_[0-9a-f]{32}$/);
-    expect(body).toContain('event: message_stop');
+    const parsed = events(body);
+    expect(parsed.map(event => event.type)).toEqual(['message_start', 'message_stop']);
+    expect(parsed[0]!.message!.id).toMatch(/^clodex_[0-9a-f]{32}$/);
   });
 
   it('replaces a JSON msg_ id', async () => {

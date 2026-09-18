@@ -223,8 +223,11 @@ export function anthropicSseMessageStartRewrite(
     if (!line.startsWith('data:') || !line.includes('"message_start"')) return line;
     try {
       // A multi-line `data:` payload (legal SSE, never emitted by Anthropic)
-      // fails to parse here and relays untouched — fail-open, so the worst
-      // case is an un-rewritten model id rather than a corrupted stream.
+      // fails to parse here and relays untouched rather than corrupting the
+      // stream. That also leaves its model and its message id un-rewritten, so
+      // a `msg_` id in such an event still reaches Claude Code as an anchor;
+      // the proxy's refusal of thread continuations on routes that cannot hold
+      // one is what keeps that case from losing context.
       const parsed = JSON.parse(line.slice(5)) as { type?: string; message?: { model?: unknown; id?: unknown } };
       if (parsed.type !== 'message_start' || !parsed.message) return line;
       let changed = false;
