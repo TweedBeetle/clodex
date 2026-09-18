@@ -57,11 +57,6 @@ const TRANSPORTS = Object.assign(Object.create(null), {
   // Go docs list them on /v1/responses with @ai-sdk/openai.
   'muse-spark-1.2-contributor': 'openai-responses',
   'muse-spark-1.3-contributor': 'openai-responses',
-  // Measured 2026-09-17 against the live Go endpoint: answers 200 on
-  // /v1/messages, 500 on /v1/chat/completions and /v1/responses. models.dev
-  // publishes provider.npm '@ai-sdk/anthropic' for it, agreeing. Cloaked
-  // model (vendor undisclosed), free tier, so its traffic is the lab's price.
-  'union-alpha': 'anthropic-messages',
   'qwen3.6-plus': 'openai-completions',
   'qwen3.7-max': 'anthropic-messages',
   'qwen3.7-plus': 'anthropic-messages',

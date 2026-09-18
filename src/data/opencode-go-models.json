@@ -563,28 +563,5 @@
     },
     "upstreamModelId": "qwen3.8-max",
     "family": "qwen3.8"
-  },
-  {
-    "id": "union-alpha",
-    "name": "Union Alpha Free",
-    "contextWindow": 262144,
-    "cost": {
-      "input": 0,
-      "output": 0
-    },
-    "modelFormat": "anthropic",
-    "npm": "@ai-sdk/anthropic",
-    "apiUrl": "https://opencode.ai/zen/go",
-    "reasoning": true,
-    "modalities": [
-      "text",
-      "image"
-    ],
-    "compatibility": {
-      "supportsCountTokens": false,
-      "supportsReasoningEffort": false
-    },
-    "upstreamModelId": "union-alpha",
-    "family": "union"
   }
 ]
