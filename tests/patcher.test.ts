@@ -588,8 +588,8 @@ describe('PATCH_TRANSFORMS_VERSION', () => {
       .join('\n');
     const digest = createHash('sha256').update(source).digest('hex');
     expect({ version: PATCH_TRANSFORMS_VERSION, digest }).toEqual({
-      version: 14,
-      digest: '108c09d9866ee6fa3c04ca26a1fe8b01e5978ad07a872dbad0837a7a76748f54',
+      version: 15,
+      digest: 'd43c5d50fcbb11dee97c7f0845bfbaa34f671ca6014f99f826ed2ed1a67c75f5',
     });
   });
 });
