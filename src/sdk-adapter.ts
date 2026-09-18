@@ -1,5 +1,5 @@
 // Anthropic /v1/messages ↔ Vercel AI SDK. One turn per request; Claude Code owns the tool loop.
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { streamText, generateText, tool, jsonSchema } from 'ai';
 import type { LanguageModel, ModelMessage } from 'ai';
 import {
@@ -870,6 +870,24 @@ export function forwardAbortSignal(source: AbortSignal | undefined, target: Abor
   return () => source.removeEventListener('abort', forward);
 }
 
+/**
+ * The id clodex gives a message it translated from another provider.
+ *
+ * It must NOT start with `msg_`. Claude Code (2.1.27x and later) treats an
+ * assistant message whose id starts with `msg_` as an anchor for server-side
+ * thread continuation: the next request carries
+ * `thread:{type:"continue",previous_message_id}` and only the messages after
+ * that anchor, trusting the server to hold the rest. No translated upstream
+ * holds that state, and clodex does not reconstruct it, so the delta reached
+ * the provider as a bare tool result (`No function call found for function
+ * call output`), and Claude Code retried every such request with the full
+ * history. An id outside the anchor prefix makes Claude Code send the full
+ * history in the first place, which is what these routes are built for.
+ */
+export function translatedMessageId(): string {
+  return 'clodex_' + randomUUID().replace(/-/g, '');
+}
+
 export async function writeAnthropicStream(
   stream: AsyncIterable<FullStreamPart>,
   modelId: string,
@@ -878,7 +896,7 @@ export async function writeAnthropicStream(
   observer?: AnthropicStreamObserver,
   tools?: SdkCallParams['tools'],
 ): Promise<void> {
-  const messageId = 'msg_' + Date.now();
+  const messageId = translatedMessageId();
   const requiredProps = toolRequiredProps(tools);
   let blockIndex = -1;
   let started = false;
@@ -1302,7 +1320,7 @@ export async function generateAnthropicResponse(
   reportPromptTokens({ onPromptTokens: options?.onPromptTokens }, usage);
   const requiredProps = toolRequiredProps(params.tools);
   return {
-    id: 'msg_' + Date.now(), type: 'message', role: 'assistant', model: modelId,
+    id: translatedMessageId(), type: 'message', role: 'assistant', model: modelId,
     content: [
       ...(text ? [{ type: 'text', text }] : []),
       ...toolCalls.map(tc => ({
