@@ -381,11 +381,29 @@ export function applyClodexPatches(source: string, config: PatchScriptModelConfi
     // `default:return`, which is where an injected case and any native sibling
     // case live. The cases BEFORE `case"best"` are the reserved tier names,
     // which an alias cannot take, so the region need not reach back past it.
+    //
+    // The size bound has to count the cases PATCH 6 itself injects, because
+    // they land INSIDE the region. With a fixed bound, enough alias text (20
+    // favorites at the 64-char alias maximum is 2900 bytes) pushed the
+    // switch's `default:return` out of reach on a re-patch: the region stopped
+    // matching, every alias read as missing, the cases went in a second time,
+    // and the built-in verification, which requires a re-run over patched
+    // output to be a no-op, rolled back the local patch set. The 2000 is
+    // headroom for upstream drift; the added term is exactly the bytes of our
+    // own `case"<a>":return "<a>";` entries. The quantifier is lazy, so a
+    // larger bound can only turn a miss into a match; it never moves where the
+    // region ends.
     const RESOLVER_ANCHOR = /(case"best":\{[^{}]*\})/;
-    const RESOLVER_SWITCH = /case"best":\{[^{}]*\}[\s\S]{0,2000}?default:return/;
-    // Skipping an alias the bundle already resolves is deliberate — a native
-    // `case"sol":return "native";` must win rather than be shadowed by an
-    // injected duplicate. But `case"<word>":return` is not a rare string, and
+    const RESOLVER_BUDGET = 2000 + ALIASES.reduce((n, a) => n + 2 * a.length + 17, 0);
+    const RESOLVER_SWITCH = new RegExp(
+      'case"best":\\{[^{}]*\\}[\\s\\S]{0,' + RESOLVER_BUDGET + '}?default:return',
+    );
+    // The presence test's job is RE-PATCH IDEMPOTENCY: a case this patch
+    // already injected must be recognised, so a second run over patched
+    // output is the no-op the built-in verification demands. (It would also
+    // stop an injected duplicate shadowing a native non-reserved case placed
+    // after `case"best"`; no build ships one today, since every native case
+    // sits before it.) But `case"<word>":return` is not a rare string, and
     // the switch it sits in is what decides whether it means anything here:
     // zod's schema walker ships `case"union":return ...`, so an alias named
     // `union` read as natively resolved. Its case was dropped silently, its
