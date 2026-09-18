@@ -57,6 +57,9 @@ const TRANSPORTS = Object.assign(Object.create(null), {
   // Go docs list them on /v1/responses with @ai-sdk/openai.
   'muse-spark-1.2-contributor': 'openai-responses',
   'muse-spark-1.3-contributor': 'openai-responses',
+  // Measured 2026-09-18: 200 with tool calls on /v1/chat/completions, 500 on
+  // /v1/messages and /v1/responses. Cloaked model; models.dev marks it deprecated.
+  'omen-alpha': 'openai-completions',
   'qwen3.6-plus': 'openai-completions',
   'qwen3.7-max': 'anthropic-messages',
   'qwen3.7-plus': 'anthropic-messages',
@@ -80,6 +83,9 @@ const PATCHES = Object.assign(Object.create(null), {
   // reasons by default; clodex has no verified control to advertise yet.
   'muse-spark-1.2-contributor': { supportsReasoningEffort: false },
   'muse-spark-1.3-contributor': { supportsReasoningEffort: false },
+  // The feed publishes low/high; the wire parameter on this route is unverified,
+  // so send none and let the model reason by default.
+  'omen-alpha': { supportsReasoningEffort: false },
   'deepseek-v4-flash': {
     reasoningEffortMap: { minimal: null, low: null, medium: null, high: 'high', max: 'max' },
     supportsStore: false,

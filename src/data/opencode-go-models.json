@@ -455,6 +455,29 @@
     "family": "muse"
   },
   {
+    "id": "omen-alpha",
+    "name": "Omen Alpha",
+    "contextWindow": 500000,
+    "cost": {
+      "input": 0.2,
+      "output": 0.66,
+      "cache_read": 0.04
+    },
+    "modelFormat": "openai",
+    "npm": "@ai-sdk/openai-compatible",
+    "apiUrl": "https://opencode.ai/zen/go/v1",
+    "reasoning": true,
+    "modalities": [
+      "text",
+      "image"
+    ],
+    "compatibility": {
+      "supportsReasoningEffort": false
+    },
+    "upstreamModelId": "omen-alpha",
+    "family": "omen"
+  },
+  {
     "id": "qwen3.6-plus",
     "name": "Qwen3.6 Plus",
     "contextWindow": 1000000,
