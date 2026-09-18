@@ -2436,10 +2436,12 @@ describe('translated message ids', () => {
     expect(message.id.startsWith('msg_')).toBe(false);
   });
 
-  it('gives each translated message its own id', async () => {
+  it('gives each translated message a random id, not a timestamp', async () => {
     const first = await collect([{ type: 'start' }, { type: 'finish', finishReason: 'stop', totalUsage: { inputTokens: 1, outputTokens: 1 } }]);
     const second = await collect([{ type: 'start' }, { type: 'finish', finishReason: 'stop', totalUsage: { inputTokens: 1, outputTokens: 1 } }]);
     const idOf = (r: typeof first) => r.events.find(e => e.event === 'message_start')?.data.message.id;
+    expect(idOf(first)).toMatch(/^clodex_[0-9a-f]{32}$/);
+    expect(idOf(second)).toMatch(/^clodex_[0-9a-f]{32}$/);
     expect(idOf(first)).not.toBe(idOf(second));
   });
 });

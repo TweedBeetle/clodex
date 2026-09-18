@@ -873,18 +873,21 @@ export function forwardAbortSignal(source: AbortSignal | undefined, target: Abor
 /**
  * The id clodex gives a message it translated from another provider.
  *
- * It must NOT start with `msg_`. Claude Code (2.1.27x and later) treats an
- * assistant message whose id starts with `msg_` as an anchor for server-side
- * thread continuation: the next request carries
+ * It must NOT start with `msg_`. Claude Code (the gate is in every build from
+ * 2.1.268 on, and fires in proxy mode when its thread rollout is enabled)
+ * treats an assistant message as an anchor for server-side thread
+ * continuation when its id starts with `msg_`, or when the response carried a
+ * `request-id` header; translated responses never send that header, so the id
+ * alone decides. An anchored follow-up carries
  * `thread:{type:"continue",previous_message_id}` and only the messages after
- * that anchor, trusting the server to hold the rest. No translated upstream
- * holds that state, and clodex does not reconstruct it, so the delta reached
+ * the anchor, trusting the server to hold the rest. No translated upstream
+ * holds that state and clodex does not reconstruct it, so the delta reached
  * the provider as a bare tool result (`No function call found for function
- * call output`), and Claude Code retried every such request with the full
+ * call output`), and Claude Code retried each such request with the full
  * history. An id outside the anchor prefix makes Claude Code send the full
  * history in the first place, which is what these routes are built for.
  */
-export function translatedMessageId(): string {
+function translatedMessageId(): string {
   return 'clodex_' + randomUUID().replace(/-/g, '');
 }
 
