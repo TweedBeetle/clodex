@@ -513,3 +513,69 @@ describe('relayAnthropicMessages streaming', () => {
     expect(res.body()).toBe(SSE);
   });
 });
+
+describe('relayAnthropicMessages anchor-safe message ids', () => {
+  // Claude Code anchors server-side thread continuation on a reply whose id
+  // starts with `msg_`, then sends only the messages after it. Callers set
+  // `anchorSafeMessageIds` when the upstream holds no threads.
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function makeStreamRes() {
+    const chunks: Buffer[] = [];
+    const res = new Writable({
+      write(chunk: Buffer, _enc, cb) { chunks.push(Buffer.from(chunk)); cb(); },
+    }) as Writable & { writeHead: (code: number, hdrs?: Record<string, string>) => unknown; body: () => string };
+    res.writeHead = () => res;
+    res.body = () => Buffer.concat(chunks).toString('utf8');
+    return res;
+  }
+
+  const sse = (id: string) => [
+    'event: message_start',
+    `data: {"type":"message_start","message":{"id":"${id}","model":"qwen3.8-max","content":[]}}`,
+    '',
+    'event: message_stop',
+    'data: {"type":"message_stop"}',
+    '',
+  ].join('\n');
+
+  async function relay(stream: boolean, upstreamBody: string, options: Parameters<typeof relayAnthropicMessages>[5]) {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(upstreamBody, {
+      status: 200,
+      headers: { 'Content-Type': stream ? 'text/event-stream' : 'application/json' },
+    })));
+    const res = makeStreamRes();
+    const done = new Promise<void>(resolve => res.on('finish', () => resolve()));
+    await relayAnthropicMessages(res as never, 'https://opencode.ai/zen/go/v1/messages', { model: 'qwen3.8-max', stream }, 'key', stream, options);
+    await done;
+    return res.body();
+  }
+
+  const jsonMessage = (id: string) => JSON.stringify({ id, type: 'message', model: 'qwen3.8-max', content: [] });
+
+  it('replaces a streamed msg_ id', async () => {
+    const body = await relay(true, sse('msg_4c571f9f-eb72-47d9-94fb-36288b9ba3c6'), { anchorSafeMessageIds: true });
+    expect(/"id":"([^"]+)"/.exec(body)?.[1]).toMatch(/^clodex_[0-9a-f]{32}$/);
+    expect(body).toContain('event: message_stop');
+  });
+
+  it('replaces a JSON msg_ id', async () => {
+    const body = await relay(false, jsonMessage('msg_8ed0ab5b-cb18-401d-aa24-f6b6d3b048e7'), { anchorSafeMessageIds: true });
+    expect((JSON.parse(body) as { id: string }).id).toMatch(/^clodex_[0-9a-f]{32}$/);
+  });
+
+  it('leaves an id Claude Code does not anchor on byte-for-byte', async () => {
+    const upstream = sse('e3bcf999-e99c-42bc-b256-ae9c28d153b2');
+    expect(await relay(true, upstream, { anchorSafeMessageIds: true })).toBe(upstream);
+  });
+
+  it('keeps a msg_ id without the option, including when the model is rewritten', async () => {
+    const streamed = await relay(true, sse('msg_01Keep'), { responseModelOverride: 'qwen' });
+    expect(streamed).toContain('"id":"msg_01Keep"');
+    expect(streamed).toContain('"model":"qwen"');
+    const json = await relay(false, jsonMessage('msg_01Keep'), {});
+    expect((JSON.parse(json) as { id: string }).id).toBe('msg_01Keep');
+  });
+});
