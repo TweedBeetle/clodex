@@ -47,12 +47,12 @@ describe('OpenCode Go catalog', () => {
 
     expect(OPENCODE_GO_SOURCE).toBe('https://models.dev/api.json');
     expect(new Date(OPENCODE_GO_SOURCE_FETCHED_AT).toISOString()).toBe(OPENCODE_GO_SOURCE_FETCHED_AT);
-    expect(models).toHaveLength(21);
+    expect(models).toHaveLength(20);
     expect(new Set(ids).size).toBe(models.length);
     expect(ids).not.toContain('grok-4.5');
     expect(new Set(models.map(model => model.modelFormat))).toEqual(new Set(['anthropic', 'openai']));
     expect(models.filter(model => model.modelFormat === 'anthropic')).toHaveLength(5);
-    expect(models.filter(model => model.modelFormat === 'openai')).toHaveLength(16);
+    expect(models.filter(model => model.modelFormat === 'openai')).toHaveLength(15);
     expect(models.filter(model => model.npm === '@ai-sdk/openai').map(model => model.id).sort())
       .toEqual(['muse-spark-1.2-contributor', 'muse-spark-1.3-contributor']);
   });
