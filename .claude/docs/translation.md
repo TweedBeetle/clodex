@@ -17,6 +17,20 @@ hand-rolled per-provider translation. Preserved hard-won behavior:
   responses in testing.
 - Cache reads and GPT-5.6 cache writes map to Anthropic
   `cache_read_input_tokens`/`cache_creation_input_tokens`.
+- **On OpenRouter routes, translated requests carry an `x-session-id` header** so OpenRouter can
+  keep a conversation on one upstream provider; its prompt-caching guide names the header as its
+  sticky routing key. The value is Claude Code's session UUID put through
+  `claudeSessionPromptCacheKey` — the same opaque key the OpenAI route sends as
+  `prompt_cache_key` — or the system+tools prompt cache key when the client sends no session
+  identity. Stickiness is per provider, not per backend node, and subject to OpenRouter's
+  eligibility rules, fallback and 10-minute idle expiry; no cache-hit improvement has been
+  measured for it.
+  The route is recognised by `isOpenRouterRoute`, which in practice matches a base URL containing
+  `openrouter.ai`: its other two clauses, the `@openrouter/ai-sdk-provider` package and an
+  `openrouter` provider id, name nothing clodex ships. **Keep it endpoint-derived.** A custom
+  provider's id comes from the display name the user typed and a gateway can list `openrouter/*`
+  model ids, so neither is evidence of the upstream — and the same predicate decides reasoning
+  capabilities and effort, where a false positive silently changes what a provider is asked to do.
 - Consecutive OpenAI Responses reasoning summaries/items stream into **one Anthropic thinking
   block** until text, a tool, or successful completion closes it. A thinking-only WebSocket drop
   leaves that block open, so an earlier summary cannot disable Claude Code's mid-stream retry.

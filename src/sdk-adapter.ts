@@ -15,6 +15,7 @@ import {
   deepMergeProviderOptions,
   effortProviderOptions,
   thinkingProviderOptions,
+  isOpenRouterRoute,
   type ReasoningMetadata,
 } from './provider-factory.js';
 import { resolveUpstreamTools } from './tool-search.js';
@@ -687,8 +688,8 @@ export function translateRequest(
   // GPT-5.6+ public-API implicit mode also
   // honors the explicit breakpoints copied from Claude Code's cache_control
   // blocks, while retaining an automatic latest-message breakpoint as fallback.
+  const claudeSessionId = extractClaudeSessionId(body, options?.claudeSessionId);
   if (npm === '@ai-sdk/openai') {
-    const claudeSessionId = extractClaudeSessionId(body, options?.claudeSessionId);
     const serviceTier = options?.openAiOAuth ? oauthServiceTier() : undefined;
     providerOptions = deepMergeProviderOptions(providerOptions, {
       openai: {
@@ -715,18 +716,23 @@ export function translateRequest(
     maxOutputTokens: options?.openAiOAuth ? undefined : body.max_tokens,
     temperature: body.temperature,
     providerOptions,
+    // OpenRouter derives its own conversation key when none is sent, and routes a
+    // session's requests to one provider when one is. The value needs to be stable
+    // and unique, not recognizable, so the session UUID goes over hashed through
+    // the same key the OpenAI route's prompt_cache_key uses; the system/tools hash
+    // stays the fallback for clients that send no session identity.
+    ...(isOpenRouterRoute(npm, options?.reasoningMetadata)
+      ? {
+          headers: {
+            'x-session-id': claudeSessionId
+              ? claudeSessionPromptCacheKey(claudeSessionId)
+              : openAiPromptCacheKey(baseSystem, upstreamTools),
+          },
+        }
+      : {}),
   };
 }
 
-/**
- * Service tier for ChatGPT-OAuth (Codex backend) requests — Codex "fast mode"
- * (Codex CLI config `service_tier = "fast"`; wire value `priority`). Applied
- * ONLY on the OAuth route, and only after alias/remap resolution, so an alias
- * that resolves to a ChatGPT model gets the tier while the same worker slot
- * remapped to a non-OpenAI provider never sends it. API-key OpenAI is
- * deliberately excluded: on the public API `priority` is a billable per-token
- * surcharge, not a plan feature. Absence preserves the backend default exactly.
- */
 /**
  * Whether a route is the ChatGPT-OAuth (Codex) backend — the only one that
  * carries a service tier.
@@ -745,6 +751,15 @@ const SERVICE_TIERS = new Set(['auto', 'default', 'flex', 'priority']);
 let warnedInvalidServiceTier = false;
 let warnedUnsupportedServiceTier = false;
 
+/**
+ * Service tier for ChatGPT-OAuth (Codex backend) requests — Codex "fast mode"
+ * (Codex CLI config `service_tier = "fast"`; wire value `priority`). Applied
+ * ONLY on the OAuth route, and only after alias/remap resolution, so an alias
+ * that resolves to a ChatGPT model gets the tier while the same worker slot
+ * remapped to a non-OpenAI provider never sends it. API-key OpenAI is
+ * deliberately excluded: on the public API `priority` is a billable per-token
+ * surcharge, not a plan feature. Absence preserves the backend default exactly.
+ */
 export function oauthServiceTier(): string | undefined {
   const raw = process.env.CLODEX_SERVICE_TIER;
   if (raw === undefined || raw.trim() === '') return undefined;
