@@ -1016,6 +1016,10 @@ describe('selective HTTP proxy', () => {
   }, 20_000);
 
   it('logs an Anthropic connection failure as an upstream response failure', async () => {
+    // This pins the failure record written once the proxy gives up; the outage
+    // hold that precedes it is covered in 'outage hold', so skip it here.
+    const previousHold = process.env['CLODEX_PASSTHROUGH_OUTAGE_HOLD_MS'];
+    process.env['CLODEX_PASSTHROUGH_OUTAGE_HOLD_MS'] = '0';
     const certificates = ensureHttpProxyCertificates();
     const inferenceLogPath = join(testHome, 'connection-refused-inference.jsonl');
     const unavailableOrigin = https.createServer({
@@ -1070,6 +1074,8 @@ describe('selective HTTP proxy', () => {
         statusCode: 502,
       }));
     } finally {
+      if (previousHold === undefined) delete process.env['CLODEX_PASSTHROUGH_OUTAGE_HOLD_MS'];
+      else process.env['CLODEX_PASSTHROUGH_OUTAGE_HOLD_MS'] = previousHold;
       await proxy?.close();
     }
   }, 20_000);
@@ -2532,6 +2538,177 @@ describe('selective HTTP proxy', () => {
         else process.env['CLODEX_UPSTREAM_MAX_RETRIES'] = previous;
       }
     }, 20_000);
+
+    describe('outage hold', () => {
+      const HOLD_ENV = 'CLODEX_PASSTHROUGH_OUTAGE_HOLD_MS';
+      let previousHold: string | undefined;
+      beforeEach(() => { previousHold = process.env[HOLD_ENV]; });
+      afterEach(() => {
+        if (previousHold === undefined) delete process.env[HOLD_ENV];
+        else process.env[HOLD_ENV] = previousHold;
+      });
+
+      function okOrigin(): { server: https.Server; bodies: string[] } {
+        const certificates = ensureHttpProxyCertificates();
+        const bodies: string[] = [];
+        const server = https.createServer({ key: certificates.serverKey, cert: certificates.serverCert }, (req, res) => {
+          const chunks: Buffer[] = [];
+          req.on('data', (chunk: Buffer) => chunks.push(chunk));
+          req.once('end', () => {
+            bodies.push(Buffer.concat(chunks).toString());
+            res.writeHead(200, {
+              'Content-Type': 'application/json',
+              'Content-Length': String(Buffer.byteLength(ORIGIN_BODY)),
+            });
+            res.end(ORIGIN_BODY);
+          });
+        });
+        return { server, bodies };
+      }
+
+      async function freePort(): Promise<number> {
+        const probe = net.createServer();
+        probe.listen(0, '127.0.0.1');
+        await once(probe, 'listening');
+        const port = (probe.address() as net.AddressInfo).port;
+        await new Promise<void>(resolve => probe.close(() => resolve()));
+        return port;
+      }
+
+      it('holds a request whose upstream name does not resolve, then answers 502 when the hold is spent', async () => {
+        // A simulated DNS outage: `.invalid` never resolves (RFC 6761).
+        process.env[HOLD_ENV] = '2500';
+        const certificates = ensureHttpProxyCertificates();
+        const inferenceLogPath = join(testHome, 'passthrough-outage-dns.jsonl');
+        const proxy = await startHttpProxy({
+          routes: [],
+          inferenceLogPath,
+          anthropicOrigin: 'https://clodex-outage-test.invalid',
+          anthropicRejectUnauthorized: false,
+        });
+        try {
+          const secure = await connectMitm(proxy.port, certificates.caCert);
+          let response = '';
+          secure.on('data', chunk => { response += chunk.toString(); });
+          const sentAt = Date.now();
+          secure.write(messagesRequest(JSON.stringify({ model: 'claude-opus-4-8', messages: [{ role: 'user', content: 'dns' }] })));
+          await awaitStatus502(secure, () => response);
+          const heldMs = Date.now() - sentAt;
+          secure.destroy();
+
+          // Held for the whole budget rather than failing in milliseconds.
+          expect(heldMs).toBeGreaterThanOrEqual(2_400);
+          expect(response).toContain('Anthropic upstream unreachable');
+          const entries = await readLog(inferenceLogPath);
+          const retried = entries.filter(entry => entry['event'] === 'response_retried');
+          expect(retried.length).toBeGreaterThanOrEqual(2);
+          for (const entry of retried) {
+            expect(entry).toMatchObject({ outageHold: true, reusedSocket: false, phase: 'waiting_for_headers' });
+            expect(['ENOTFOUND', 'EAI_AGAIN', 'EAI_FAIL']).toContain(entry['errorType']);
+          }
+          // Backoff doubles: 1 s, then the remainder of the budget.
+          expect(retried[0]).toMatchObject({ retryDelayMs: 1_000, holdElapsedMs: 0 });
+          expect(entries).toContainEqual(expect.objectContaining({ event: 'response_failed', statusCode: 502 }));
+        } finally {
+          await proxy.close();
+        }
+      }, 20_000);
+
+      it('delivers the request once, unchanged, when the upstream comes back during the hold', async () => {
+        process.env[HOLD_ENV] = '10000';
+        const certificates = ensureHttpProxyCertificates();
+        const inferenceLogPath = join(testHome, 'passthrough-outage-recover.jsonl');
+        const port = await freePort();
+        const { server, bodies } = okOrigin();
+        const proxy = await startHttpProxy({
+          routes: [],
+          inferenceLogPath,
+          anthropicOrigin: `https://127.0.0.1:${port}`,
+          anthropicRejectUnauthorized: false,
+        });
+        try {
+          const secure = await connectMitm(proxy.port, certificates.caCert);
+          let response = '';
+          secure.on('data', chunk => { response += chunk.toString(); });
+          const body = JSON.stringify({ model: 'claude-opus-4-8', messages: [{ role: 'user', content: 'recover' }] });
+          secure.write(messagesRequest(body));
+          // Nothing listens yet: every attempt is refused. Bring the origin up mid-hold.
+          await new Promise(resolve => setTimeout(resolve, 1_500));
+          server.listen(port, '127.0.0.1');
+          await once(server, 'listening');
+          await awaitResponses(secure, () => response, 1);
+          secure.destroy();
+
+          expect(response).toContain('200 OK');
+          expect(response).not.toContain('502');
+          // Exactly one delivery, byte for byte: the refused attempts sent nothing.
+          expect(bodies).toEqual([body]);
+          const entries = await readLog(inferenceLogPath);
+          const retried = entries.filter(entry => entry['event'] === 'response_retried');
+          expect(retried.length).toBeGreaterThanOrEqual(1);
+          for (const entry of retried) expect(entry).toMatchObject({ outageHold: true, errorType: 'ECONNREFUSED' });
+          expect(entries).toContainEqual(expect.objectContaining({
+            event: 'response_completed',
+            attempt: retried.length + 1,
+          }));
+        } finally {
+          await proxy.close();
+          await new Promise<void>(resolve => server.close(() => resolve()));
+        }
+      }, 20_000);
+
+      it('answers 502 at once when the hold is turned off', async () => {
+        process.env[HOLD_ENV] = '0';
+        const certificates = ensureHttpProxyCertificates();
+        const inferenceLogPath = join(testHome, 'passthrough-outage-off.jsonl');
+        const proxy = await startHttpProxy({
+          routes: [],
+          inferenceLogPath,
+          anthropicOrigin: `https://127.0.0.1:${await freePort()}`,
+          anthropicRejectUnauthorized: false,
+        });
+        try {
+          const secure = await connectMitm(proxy.port, certificates.caCert);
+          let response = '';
+          secure.on('data', chunk => { response += chunk.toString(); });
+          const sentAt = Date.now();
+          secure.write(messagesRequest(JSON.stringify({ model: 'claude-opus-4-8', messages: [{ role: 'user', content: 'off' }] })));
+          await awaitStatus502(secure, () => response);
+          expect(Date.now() - sentAt).toBeLessThan(900);
+          secure.destroy();
+          const entries = await readLog(inferenceLogPath);
+          expect(entries.some(entry => entry['event'] === 'response_retried')).toBe(false);
+        } finally {
+          await proxy.close();
+        }
+      }, 20_000);
+
+      it('stops retrying when the client gives up during the hold', async () => {
+        process.env[HOLD_ENV] = '10000';
+        const certificates = ensureHttpProxyCertificates();
+        const inferenceLogPath = join(testHome, 'passthrough-outage-abandon.jsonl');
+        const proxy = await startHttpProxy({
+          routes: [],
+          inferenceLogPath,
+          anthropicOrigin: `https://127.0.0.1:${await freePort()}`,
+          anthropicRejectUnauthorized: false,
+        });
+        try {
+          const secure = await connectMitm(proxy.port, certificates.caCert);
+          secure.write(messagesRequest(JSON.stringify({ model: 'claude-opus-4-8', messages: [{ role: 'user', content: 'abandon' }] })));
+          await new Promise(resolve => setTimeout(resolve, 1_500));
+          secure.destroy();
+          await new Promise(resolve => setTimeout(resolve, 200));
+          const retriedBefore = (await readLog(inferenceLogPath)).filter(entry => entry['event'] === 'response_retried').length;
+          await new Promise(resolve => setTimeout(resolve, 4_000));
+          const entries = await readLog(inferenceLogPath);
+          expect(entries.filter(entry => entry['event'] === 'response_retried').length).toBe(retriedBefore);
+          expect(entries).toContainEqual(expect.objectContaining({ event: 'response_client_disconnected' }));
+        } finally {
+          await proxy.close();
+        }
+      }, 20_000);
+    });
   });
 
 });
