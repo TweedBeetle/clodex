@@ -14,7 +14,11 @@ import { normalizeRouteLookupId } from '../context-model-id.js';
 import { listenTcpServer } from '../listener-ready.js';
 import { routeUnavailableMessage } from '../route-unavailable.js';
 import { emitParentNotice } from '../parent-notice.js';
-import { passthroughUpstreamRetries } from '../upstream-retry.js';
+import {
+  outageRetryDelayMs,
+  passthroughOutageHoldMs,
+  passthroughUpstreamRetries,
+} from '../upstream-retry.js';
 import {
   OUTBOUND_PROXY_HOP_HEADER,
   isOwnOutboundProxyHop,
@@ -50,6 +54,30 @@ const MAX_USAGE_SSE_BLOCK_BYTES = 64 * 1024;
  * worth the reach. `errorType` on response_failed records it if it shows up.
  */
 const RETRYABLE_PASSTHROUGH_CODE = 'ECONNRESET';
+
+/**
+ * Failures that mean the request never reached Anthropic: name resolution
+ * failed, the connect was refused or had no route, or the connection died
+ * before TLS completed (the request bytes are only written after the
+ * handshake). During a network outage these are what every request meets, and
+ * holding them for a while is safe because nothing can have been served. The
+ * two codes that can also occur AFTER bytes went out (ECONNRESET, ETIMEDOUT)
+ * are covered by the same rule: the hold only applies while the attempt's TLS
+ * handshake has not completed.
+ */
+const OUTAGE_HOLD_CODES = new Set([
+  'ENOTFOUND',
+  'EAI_AGAIN',
+  'EAI_FAIL',
+  'ECONNREFUSED',
+  'ENETUNREACH',
+  'EHOSTUNREACH',
+  'ENETDOWN',
+  'EHOSTDOWN',
+  'EADDRNOTAVAIL',
+  'ECONNRESET',
+  'ETIMEDOUT',
+]);
 
 /**
  * The passthrough's own connection pool. `timeout` must not be dropped: it is
@@ -328,6 +356,11 @@ function forwardRawAnthropicRequest(
   return new Promise(resolve => {
     const startedAt = Date.now();
     const retryBudget = passthroughUpstreamRetries();
+    const outageHoldMs = passthroughOutageHoldMs();
+    let outageHoldStartedAt: number | undefined;
+    let outageRetries = 0;
+    let reuseRetries = 0;
+    let holdTimer: NodeJS.Timeout | undefined;
     let lastActivityAt = startedAt;
     let headersReceived = false;
     let firstByteAt: number | undefined;
@@ -401,13 +434,32 @@ function forwardRawAnthropicRequest(
     // is replayed into the same stream (pinned by the after-headers test, which
     // resets the raw TCP socket to produce exactly that arrival).
     const isRetryableUpstreamFailure = (err: Error, request: http.ClientRequest): boolean =>
-      attempt <= retryBudget
+      reuseRetries < retryBudget
       && !headersReceived
       && !failed
       && !clientDisconnected
       && !isLocalShutdown()
       && request.reusedSocket === true
       && (err as NodeJS.ErrnoException).code === RETRYABLE_PASSTHROUGH_CODE;
+
+    // Hold a request that never reached the upstream (see OUTAGE_HOLD_CODES),
+    // retrying with backoff until the hold budget is spent. Only a FRESH socket
+    // whose TLS handshake never completed qualifies: a reused socket is the
+    // case above, and a completed handshake means the body may have gone out.
+    const outageRetryDelay = (
+      err: Error,
+      request: http.ClientRequest,
+      tlsEstablished: boolean,
+    ): number | undefined => {
+      if (outageHoldMs <= 0) return undefined;
+      if (headersReceived || failed || clientDisconnected || isLocalShutdown()) return undefined;
+      if (request.reusedSocket === true || tlsEstablished) return undefined;
+      if (!OUTAGE_HOLD_CODES.has((err as NodeJS.ErrnoException).code ?? '')) return undefined;
+      const now = Date.now();
+      const remaining = outageHoldMs - (now - (outageHoldStartedAt ?? now));
+      if (remaining <= 0) return undefined;
+      return Math.min(outageRetryDelayMs(outageRetries + 1), remaining);
+    };
 
     const sendAttempt = (): void => {
       attempt += 1;
@@ -470,12 +522,45 @@ function forwardRawAnthropicRequest(
         });
       });
       upstream = request;
+      let tlsEstablished = false;
+      request.once('socket', socket => {
+        if (request.reusedSocket) return;
+        socket.once('secureConnect', () => { tlsEstablished = true; });
+      });
       request.once('error', err => {
         if (clientDisconnected) {
           done();
           return;
         }
+        const holdDelay = outageRetryDelay(err, request, tlsEstablished);
+        if (holdDelay !== undefined) {
+          const now = Date.now();
+          outageHoldStartedAt ??= now;
+          outageRetries += 1;
+          writeLifecycle('response_retried', {
+            phase: responsePhase(),
+            durationMs: now - startedAt,
+            idleMs: now - lastActivityAt,
+            errorType: errorType(err),
+            terminationSource: 'upstream_failure',
+            attempt,
+            reusedSocket: false,
+            outageHold: true,
+            holdElapsedMs: now - outageHoldStartedAt,
+            retryDelayMs: holdDelay,
+          });
+          holdTimer = setTimeout(() => {
+            holdTimer = undefined;
+            if (clientDisconnected || failed || isLocalShutdown()) {
+              done();
+              return;
+            }
+            sendAttempt();
+          }, holdDelay);
+          return;
+        }
         if (isRetryableUpstreamFailure(err, request)) {
+          reuseRetries += 1;
           const retriedAt = Date.now();
           writeLifecycle('response_retried', {
             phase: responsePhase(),
@@ -535,6 +620,10 @@ function forwardRawAnthropicRequest(
       stopProgress();
       if (res.writableFinished || failed) return;
       clientDisconnected = true;
+      if (holdTimer) {
+        clearTimeout(holdTimer);
+        holdTimer = undefined;
+      }
       const now = Date.now();
       writeLifecycle('response_client_disconnected', {
         statusCode,
