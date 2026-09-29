@@ -244,3 +244,51 @@ export function passthroughUpstreamRetries(
   }
   return DEFAULT_PASSTHROUGH_RETRIES;
 }
+
+export const PASSTHROUGH_OUTAGE_HOLD_ENV = 'CLODEX_PASSTHROUGH_OUTAGE_HOLD_MS';
+/**
+ * How long the raw Anthropic MITM path keeps retrying a request that could not
+ * reach the upstream at all (DNS failure, refused or unreachable connect, a
+ * reset before TLS completed) before answering 502. Claude Code resends a 502
+ * itself, up to its own retry count, so each of its attempts now covers a
+ * network outage of this length instead of failing in milliseconds: at its
+ * default 10 retries that is roughly 90 minutes of outage survived.
+ *
+ * The ceiling stays under Claude Code's 600 s stream-idle timeout
+ * (CLAUDE_STREAM_IDLE_TIMEOUT_MS), which would otherwise abort a held request
+ * from the client side first. `0` turns the hold off.
+ */
+export const DEFAULT_PASSTHROUGH_OUTAGE_HOLD_MS = 540_000;
+export const MAX_PASSTHROUGH_OUTAGE_HOLD_MS = 570_000;
+
+export function passthroughOutageHoldMs(
+  env: NodeJS.ProcessEnv = process.env,
+  warn: Warn = defaultWarn,
+): number {
+  const raw = env[PASSTHROUGH_OUTAGE_HOLD_ENV]?.trim();
+  if (raw === undefined || raw === '') return DEFAULT_PASSTHROUGH_OUTAGE_HOLD_MS;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 0) {
+    reportOnce(
+      `${PASSTHROUGH_OUTAGE_HOLD_ENV}=${raw}`,
+      `ignoring ${PASSTHROUGH_OUTAGE_HOLD_ENV}=${raw} (expected a non-negative integer number of milliseconds)`,
+      warn,
+    );
+    return DEFAULT_PASSTHROUGH_OUTAGE_HOLD_MS;
+  }
+  if (value > MAX_PASSTHROUGH_OUTAGE_HOLD_MS) {
+    reportOnce(
+      `${PASSTHROUGH_OUTAGE_HOLD_ENV}=${raw}`,
+      `clamping ${PASSTHROUGH_OUTAGE_HOLD_ENV}=${raw} to ${MAX_PASSTHROUGH_OUTAGE_HOLD_MS}ms `
+      + "(a longer hold would outlast Claude Code's stream-idle timeout)",
+      warn,
+    );
+    return MAX_PASSTHROUGH_OUTAGE_HOLD_MS;
+  }
+  return value;
+}
+
+/** Backoff between outage retries: 1 s, 2 s, 4 s, 8 s, then every 15 s. */
+export function outageRetryDelayMs(retry: number): number {
+  return Math.min(15_000, 1_000 * 2 ** Math.max(0, retry - 1));
+}
