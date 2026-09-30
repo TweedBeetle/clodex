@@ -310,14 +310,17 @@ Two things worth knowing about the numbers:
 | `remove <id>` | Remove a provider by id |
 | `refresh-models [id]` | Update cached model lists |
 
-For ChatGPT-plan models using Responses-Lite (the catalog's `use_responses_lite` flag),
-refresh warns when the catalog requires a newer Codex client version than clodex sends.
-Those models stay cached but are hidden from clodex's selectable catalog to avoid version
-rejections. Update clodex to a release supporting the required version to make them
-available again. Saved favorites and aliases are preserved but unavailable while their
-models are hidden. Older caches without this metadata need a refresh for newly discovered
-models. Known built-in models use their seeded minimums when absent from the cache and
-their seeded flags when discovery omits them. Models not using Responses-Lite do not send
+For ChatGPT-plan models using Responses-Lite (the catalog's `use_responses_lite` flag), refresh
+warns when the catalog requires a newer Codex client version than clodex sends, including a
+model the catalog does not offer to clodex's version even though its published minimum is
+lower. Those models stay cached but are hidden from clodex's selectable catalog to avoid
+version rejections. Update clodex to a release supporting the required version to make them
+available again. Saved favorites and aliases are preserved but unavailable while their models
+are hidden: a patched model picker can still list them, and choosing one gets an error from
+clodex instead of reaching OpenAI ("model route … is unavailable" in the default proxy mode,
+"Unknown model" in endpoint mode). Older caches without this metadata need a refresh for newly
+discovered models. Known built-in models use their seeded minimums when absent from the cache
+and their seeded flags when discovery omits them. Models not using Responses-Lite do not send
 this version header and are not hidden by this check. This check does not establish your
 account's model entitlement.
 
