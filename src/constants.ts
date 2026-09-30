@@ -13,8 +13,9 @@ export const CODEX_RESPONSES_LITE_WS_URL = 'wss://chatgpt.com/backend-api/codex/
 // bumped over time — confirm via --trace if Luna requests start failing.
 // The backend also gates new models on it: GPT-6 Luna/Sol answer 400 "not supported when
 // using Codex with a ChatGPT account" to 0.153.3 and 0.154, and are served to 0.155+
-// (codex-cli 0.157.1 measured 2026-09-26). A model release can need this raised.
-export const CODEX_RESPONSES_LITE_VERSION = '0.157.1';
+// (codex-cli 0.157.1 measured 2026-09-26). A model release can need this raised: GPT-6.1 Sol is
+// listed by /codex/models only to client 0.159+ (0.157.1 omits it, 0.159.2 lists it; 2026-09-30).
+export const CODEX_RESPONSES_LITE_VERSION = '0.159.2';
 // OpenAI-Beta opt-in for the WebSocket Responses transport.
 export const CODEX_RESPONSES_WEBSOCKETS_BETA = 'responses_websockets=2026-02-06';
 
