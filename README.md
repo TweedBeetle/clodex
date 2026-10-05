@@ -244,7 +244,7 @@ Manage favorite models (max 20) and short aliases. Favorites feed the endpoint-m
 | `--unalias <name>` | Remove a saved short name |
 | `--context <model=stop>` | Choose how much of a model's context window to use: `standard`, `max`, `default` to clear, or a token count such as `500k`. Applies to this run unless `--save` is given |
 | `--save` | With `--context`: store the stop as that model's default |
-| `--json` | Print resolved metadata for saved favorites as JSON (ids, aliases, context stop and windows, output limit, pricing boundary, effort levels). Diagnostics go to stderr so stdout stays parseable |
+| `--json` | Print resolved metadata for saved favorites as JSON (ids, aliases, context stop and windows, output limit, pricing boundary, effort levels). A model saved under several aliases lists them all in `aliases`, in saved order; `alias` is the first. Diagnostics go to stderr so stdout stays parseable |
 | `--help`, `--version` | Help / version |
 
 #### Context stops and the pricing boundary

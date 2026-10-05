@@ -188,8 +188,9 @@ export interface PatchModelMeta {
 /**
  * Build the patch model config from favorites + aliases.
  * Keys are the bare `clodex:<provider>:<model>` ids (no [1m] suffix — the
- * context patch and the suffix are mutually exclusive). When an entry has an
- * alias, that alias becomes the model's identity inside the patched binary.
+ * context patch and the suffix are mutually exclusive). Each saved alias of a
+ * model becomes one of its identities inside the patched binary: the first
+ * saved is the entry's `alias`, any others are `moreAliases`.
  */
 export function buildPatchModelConfig(
   favorites: Array<{ providerId: string; modelId: string }>,
