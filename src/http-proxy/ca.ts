@@ -17,7 +17,12 @@ const CA_KEY_FILE = 'clodex-ca-key.pem';
 const SERVER_CERT_FILE = 'api.anthropic.com.pem';
 const SERVER_KEY_FILE = 'api.anthropic.com-key.pem';
 const CERT_VERSION_FILE = 'version';
-const CERT_VERSION = '1\n';
+// 2: the server certificate carries an Authority Key Identifier. Python 3.13+ verifies with
+// VERIFY_X509_STRICT, which refuses a leaf without one ("Missing Authority Key Identifier"),
+// so any Python client sent through the proxy failed on api.anthropic.com. A version-1 store
+// keeps its CA and has only the server certificate reissued: live sessions trust the CA by
+// content (NODE_EXTRA_CA_CERTS was read at their start), so a new CA would cut them off.
+const CERT_VERSION = '2\n';
 
 function serialNumber(): string {
   const bytes = randomBytes(16);
@@ -47,6 +52,40 @@ function writePublic(path: string, value: string): void {
   chmodSync(path, 0o644);
 }
 
+function generateServerCertificate(
+  paths: ReturnType<typeof certPaths>,
+  caCert: forge.pki.Certificate,
+  caKey: forge.pki.PrivateKey,
+): void {
+  const caKeyId = (caCert.getExtension('subjectKeyIdentifier') as { subjectKeyIdentifier?: string } | null)
+    ?.subjectKeyIdentifier;
+  const serverKeys = forge.pki.rsa.generateKeyPair(2048);
+  const serverCert = forge.pki.createCertificate();
+  serverCert.publicKey = serverKeys.publicKey;
+  serverCert.serialNumber = serialNumber();
+  serverCert.validity.notBefore = new Date(Date.now() - 24 * 60 * 60 * 1000);
+  serverCert.validity.notAfter = new Date(Date.now() + 825 * 24 * 60 * 60 * 1000);
+  serverCert.setSubject([{ name: 'commonName', value: 'api.anthropic.com' }]);
+  serverCert.setIssuer(caCert.subject.attributes);
+  serverCert.setExtensions([
+    { name: 'basicConstraints', cA: false, critical: true },
+    { name: 'keyUsage', digitalSignature: true, keyEncipherment: true, critical: true },
+    { name: 'extKeyUsage', serverAuth: true },
+    { name: 'subjectAltName', altNames: [{ type: 2, value: 'api.anthropic.com' }] },
+    { name: 'subjectKeyIdentifier' },
+    {
+      name: 'authorityKeyIdentifier',
+      keyIdentifier: caKeyId
+        ? forge.util.hexToBytes(caKeyId)
+        : caCert.generateSubjectKeyIdentifier().getBytes(),
+    },
+  ]);
+  serverCert.sign(caKey as forge.pki.rsa.PrivateKey, forge.md.sha256.create());
+
+  writePrivate(paths.serverKey, forge.pki.privateKeyToPem(serverKeys.privateKey));
+  writePublic(paths.serverCert, forge.pki.certificateToPem(serverCert));
+}
+
 function generateCertificates(paths: ReturnType<typeof certPaths>): void {
   mkdirSync(paths.dir, { recursive: true, mode: 0o700 });
   chmodSync(paths.dir, 0o700);
@@ -67,28 +106,31 @@ function generateCertificates(paths: ReturnType<typeof certPaths>): void {
   ]);
   caCert.sign(caKeys.privateKey, forge.md.sha256.create());
 
-  const serverKeys = forge.pki.rsa.generateKeyPair(2048);
-  const serverCert = forge.pki.createCertificate();
-  serverCert.publicKey = serverKeys.publicKey;
-  serverCert.serialNumber = serialNumber();
-  serverCert.validity.notBefore = new Date(Date.now() - 24 * 60 * 60 * 1000);
-  serverCert.validity.notAfter = new Date(Date.now() + 825 * 24 * 60 * 60 * 1000);
-  serverCert.setSubject([{ name: 'commonName', value: 'api.anthropic.com' }]);
-  serverCert.setIssuer(caCert.subject.attributes);
-  serverCert.setExtensions([
-    { name: 'basicConstraints', cA: false, critical: true },
-    { name: 'keyUsage', digitalSignature: true, keyEncipherment: true, critical: true },
-    { name: 'extKeyUsage', serverAuth: true },
-    { name: 'subjectAltName', altNames: [{ type: 2, value: 'api.anthropic.com' }] },
-    { name: 'subjectKeyIdentifier' },
-  ]);
-  serverCert.sign(caKeys.privateKey, forge.md.sha256.create());
-
   writePrivate(paths.caKey, forge.pki.privateKeyToPem(caKeys.privateKey));
   writePublic(paths.caCert, forge.pki.certificateToPem(caCert));
-  writePrivate(paths.serverKey, forge.pki.privateKeyToPem(serverKeys.privateKey));
-  writePublic(paths.serverCert, forge.pki.certificateToPem(serverCert));
+  generateServerCertificate(paths, caCert, caKeys.privateKey);
   writePublic(paths.version, CERT_VERSION);
+}
+
+/** The stored CA and its key, when both load, pair, and stay valid past the renewal buffer. */
+function loadCurrentCa(
+  paths: ReturnType<typeof certPaths>,
+): { caCert: forge.pki.Certificate; caKey: forge.pki.PrivateKey } | null {
+  try {
+    const caCert = forge.pki.certificateFromPem(readFileSync(paths.caCert, 'utf8'));
+    const caKey = forge.pki.privateKeyFromPem(readFileSync(paths.caKey, 'utf8'));
+    const now = Date.now();
+    const renewalBuffer = 7 * 24 * 60 * 60 * 1000;
+    const pub = caCert.publicKey as forge.pki.rsa.PublicKey;
+    const priv = caKey as forge.pki.rsa.PrivateKey;
+    if (caCert.validity.notBefore.getTime() > now) return null;
+    if (caCert.validity.notAfter.getTime() <= now + renewalBuffer) return null;
+    if (!caCert.verify(caCert)) return null;
+    if (pub.n.compareTo(priv.n) !== 0) return null;
+    return { caCert, caKey };
+  } catch {
+    return null;
+  }
 }
 
 function storedCertificatesAreCurrent(paths: ReturnType<typeof certPaths>): boolean {
@@ -115,7 +157,16 @@ export function ensureHttpProxyCertificates(): HttpProxyCertificates {
   const current = required.every(existsSync)
     && readFileSync(paths.version, 'utf8') === CERT_VERSION
     && storedCertificatesAreCurrent(paths);
-  if (!current) generateCertificates(paths);
+  if (!current) {
+    // Keep a sound CA (see CERT_VERSION); reissue only what it signs.
+    const ca = required.slice(0, 2).every(existsSync) ? loadCurrentCa(paths) : null;
+    if (ca) {
+      generateServerCertificate(paths, ca.caCert, ca.caKey);
+      writePublic(paths.version, CERT_VERSION);
+    } else {
+      generateCertificates(paths);
+    }
+  }
 
   return {
     caCertPath: paths.caCert,
