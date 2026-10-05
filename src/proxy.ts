@@ -20,7 +20,6 @@ import {
   resetTraceLog,
   writeInferenceResponseLifecycleLog,
   readUpstreamServedHeaders,
-  type UpstreamServedHeaders,
   writeInferenceResponseErrorLog,
   writeWebSocketDiagnosticLog,
 } from './trace-log.js';
@@ -103,7 +102,7 @@ function createTranslationLifecycle(
   let translatedChunks = 0;
   let stopped = false;
   let dispatched = false;
-  let upstream: UpstreamServedHeaders | undefined;
+  let served = false;
 
   const write = (
     event: Parameters<typeof writeInferenceResponseLifecycleLog>[1]['event'],
@@ -115,7 +114,6 @@ function createTranslationLifecycle(
     modelId,
     provider,
     route: 'translated',
-    ...(upstream ? { upstream } : {}),
     ...extra,
   });
   const snapshot = (now: number) => ({
@@ -138,9 +136,13 @@ function createTranslationLifecycle(
   timer.unref();
 
   return {
-    /** Keep the first served-by headers seen; a request makes one upstream call. */
+    /** One upstream_served row, from the first response that names what it served. */
     onResponseHeaders(headers: Headers) {
-      upstream ??= readUpstreamServedHeaders(headers);
+      if (served) return;
+      const upstream = readUpstreamServedHeaders(headers);
+      if (!upstream) return;
+      served = true;
+      write('upstream_served', { upstream });
     },
     dispatched() {
       if (stopped || dispatched) return;
@@ -591,6 +593,27 @@ export async function startProxyCatalog(
             log: message => plog(message),
             claudeCodeSessionId,
             extraHeaders: { ...route.headers, ...goSessionHeaders },
+            // OpenCode Go names the host and model it served only in response headers
+            // (registry P-2026-09-13d); flash reaches Go on this Messages path.
+            onResponseHeaders: goSessionHeaders && inferenceLogPath && relayRequestId
+              ? headers => {
+                  const upstream = readUpstreamServedHeaders(headers);
+                  if (!upstream) return;
+                  const sessionRaw = req.headers['x-claude-code-session-id'];
+                  writeInferenceResponseLifecycleLog(inferenceLogPath, {
+                    event: 'upstream_served',
+                    requestId: relayRequestId,
+                    claudeSessionId: extractClaudeSessionId(
+                      anthropicBody,
+                      Array.isArray(sessionRaw) ? sessionRaw[0] : sessionRaw,
+                    ),
+                    modelId: originalModel,
+                    provider: route.providerId ?? route.aliasId.split(':')[1] ?? 'unknown',
+                    route: 'translated',
+                    upstream,
+                  });
+                }
+              : undefined,
             refreshToken: route.refreshToken,
             onTokenRefreshed: refreshed => { route.apiKey = refreshed; },
             signal: clientAbort.signal,
