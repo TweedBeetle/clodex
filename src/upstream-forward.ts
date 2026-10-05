@@ -120,6 +120,8 @@ export interface RelayAnthropicOptions {
   refreshToken?: (rejectedAccessToken: string) => Promise<string | null>;
   onTokenRefreshed?: (token: string) => void;
   onUpstreamError?: (statusCode: number, body: string) => void;
+  /** Called once with the upstream response's headers, before its status is acted on. */
+  onResponseHeaders?: (headers: Headers) => void;
   signal?: AbortSignal;
   /**
    * Echo this exact model id in the relayed response instead of the upstream's,
@@ -310,6 +312,7 @@ export async function relayAnthropicMessages(
     throw new UpstreamUnreachableError(err);
   }
 
+  try { options.onResponseHeaders?.(upstreamRes.headers); } catch { /* observer only */ }
   if (!upstreamRes.ok) {
     const errBody = await upstreamRes.text();
     options.log?.(`anthropic upstream ${upstreamRes.status}: ${errBody}`);
