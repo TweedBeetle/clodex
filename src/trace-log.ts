@@ -294,6 +294,34 @@ export interface InferenceResponseLifecycleLogEntry {
   holdElapsedMs?: number;
   /** Delay before the next attempt. */
   retryDelayMs?: number;
+  /**
+   * What an aggregator says it actually served, read off its response headers. OpenCode Go
+   * sends x-opencode-endpoint-id, x-opencode-upstream-model-id and x-zen-model; nothing else
+   * on the wire names the host or the model behind an alias such as deepseek-flash.
+   */
+  upstream?: UpstreamServedHeaders;
+}
+
+export interface UpstreamServedHeaders {
+  endpointId?: string;
+  upstreamModelId?: string;
+  zenModel?: string;
+}
+
+const UPSTREAM_SERVED_HEADER_NAMES: Record<keyof UpstreamServedHeaders, string> = {
+  endpointId: 'x-opencode-endpoint-id',
+  upstreamModelId: 'x-opencode-upstream-model-id',
+  zenModel: 'x-zen-model',
+};
+
+/** The served-by headers present on a response, or undefined when it carries none. */
+export function readUpstreamServedHeaders(headers: Headers): UpstreamServedHeaders | undefined {
+  const out: UpstreamServedHeaders = {};
+  for (const [key, name] of Object.entries(UPSTREAM_SERVED_HEADER_NAMES) as [keyof UpstreamServedHeaders, string][]) {
+    const value = headers.get(name)?.trim();
+    if (value) out[key] = value;
+  }
+  return Object.keys(out).length ? out : undefined;
 }
 
 export type ProxyLifecycleEvent =
@@ -503,6 +531,13 @@ export function writeInferenceResponseLifecycleLog(
     ...(entry.outageHold !== undefined ? { outageHold: entry.outageHold } : {}),
     ...(entry.holdElapsedMs !== undefined ? { holdElapsedMs: entry.holdElapsedMs } : {}),
     ...(entry.retryDelayMs !== undefined ? { retryDelayMs: entry.retryDelayMs } : {}),
+    ...(entry.upstream
+      ? {
+          upstream: Object.fromEntries(
+            Object.entries(entry.upstream).map(([k, v]) => [k, compactLogValue(v, 200)]),
+          ),
+        }
+      : {}),
   }));
 }
 
