@@ -1,10 +1,11 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createServer } from 'node:http';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createLanguageModel } from '../src/provider-factory.js';
 import { generateAnthropicResponse } from '../src/sdk-adapter.js';
+import { relayAnthropicMessages } from '../src/upstream-forward.js';
 import { readUpstreamServedHeaders, writeInferenceResponseLifecycleLog } from '../src/trace-log.js';
 
 // What OpenCode Go returned on 2026-09-26 for deepseek-flash (model-currency registry P-2026-09-13d).
@@ -84,4 +85,32 @@ describe('lifecycle log', () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+});
+
+describe('served-by headers on the Messages relay (the path flash takes to Go)', () => {
+  afterEach(() => { vi.unstubAllGlobals(); });
+  const makeRes = () => {
+    const res = {
+      writeHead() { return res; }, write() { return true; },
+      end() { res.finished = true; }, destroy() { /* noop */ },
+      on() { return res; }, once() { return res; }, emit() { return false; },
+      removeListener() { return res; }, finished: false,
+    };
+    return res;
+  };
+  for (const status of [200, 429]) {
+    it(`hands the headers to onResponseHeaders on a ${status}`, async () => {
+      vi.stubGlobal('fetch', vi.fn(async () => new Response(
+        JSON.stringify({ id: 'msg_1', type: 'message', model: 'deepseek-v4.1-flash', content: [] }),
+        { status, headers: { 'Content-Type': 'application/json', ...SERVED } },
+      )));
+      const seen: Headers[] = [];
+      await relayAnthropicMessages(
+        makeRes() as never, 'https://opencode.ai/zen/go/v1/messages', { model: 'deepseek-v4.1-flash' },
+        'key', false, { onResponseHeaders: h => seen.push(h) },
+      );
+      expect(seen).toHaveLength(1);
+      expect(readUpstreamServedHeaders(seen[0]!)?.endpointId).toBe('deepseek.an');
+    });
+  }
 });

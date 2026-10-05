@@ -231,7 +231,9 @@ export type InferenceResponseLifecycleEvent =
   | 'response_failed'
   | 'response_retried'
   | 'response_client_disconnected'
-  | 'response_usage';
+  | 'response_usage'
+  /** What an aggregator says it served (see UpstreamServedHeaders); once per request. */
+  | 'upstream_served';
 
 export type InferenceResponsePhase =
   | 'preparing_translation'
