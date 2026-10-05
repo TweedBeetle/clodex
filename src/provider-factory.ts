@@ -120,6 +120,25 @@ export interface ProviderModelSpec {
   onDebug?: (msg: string) => void;
   /** Optional privacy-safe structured WebSocket diagnostics. */
   onWebSocketDiagnostic?: (event: ResponsesWebSocketDiagnosticEvent) => void;
+  /**
+   * Called with each HTTP response's headers (API-key and no-auth routes; not the OAuth
+   * WebSocket transport). Used to record which host an aggregator actually served.
+   */
+  onResponseHeaders?: (headers: Headers) => void;
+}
+
+/** Wrap a fetch so every response's headers reach `observe`; identity when there is no observer. */
+function observingFetch(
+  observe: ((headers: Headers) => void) | undefined,
+  base?: typeof fetch,
+): typeof fetch | undefined {
+  if (!observe) return base;
+  const inner = base ?? fetch;
+  return (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+    const response = await inner(input, init);
+    try { observe(response.headers); } catch { /* an observer must never fail the request */ }
+    return response;
+  }) as typeof fetch;
 }
 
 /** True when this provider routes through the SDK adapter (local providers + Zen/Go openai-format). */
@@ -163,6 +182,8 @@ async function loadSdkProviderFactory(npm: string): Promise<SdkProviderFactory> 
 
 export async function createLanguageModel(spec: ProviderModelSpec): Promise<LanguageModel> {
   const { npm, modelId, apiKey, baseURL } = spec;
+  const noAuthFetch = observingFetch(spec.onResponseHeaders, fetchWithoutCredentialHeaders);
+  const apiKeyFetch = observingFetch(spec.onResponseHeaders);
 
   if (npm === '@ai-sdk/openai') {
     const { createOpenAI } = await import('@ai-sdk/openai');
@@ -205,13 +226,18 @@ export async function createLanguageModel(spec: ProviderModelSpec): Promise<Lang
         ? {
             apiKey: '',
             ...(spec.headers ? { headers: spec.headers } : {}),
-            fetch: fetchWithoutCredentialHeaders,
+            fetch: noAuthFetch,
           }
         // An API-key route to a third-party Responses host (OpenCode Go serves
         // Muse Spark and GPT-6 Luna on /v1/responses) must reach THAT host.
         // Without the base URL the SDK defaults to api.openai.com and sends
         // the provider's key there.
-        : { apiKey, ...(baseURL ? { baseURL } : {}), ...(spec.headers ? { headers: spec.headers } : {}) };
+        : {
+            apiKey,
+            ...(baseURL ? { baseURL } : {}),
+            ...(spec.headers ? { headers: spec.headers } : {}),
+            ...(apiKeyFetch ? { fetch: apiKeyFetch } : {}),
+          };
     const openai = createOpenAI(oauthOptions);
     return useResponsesEndpoint ? openai.responses(modelId) : openai.chat(modelId);
   }
@@ -257,7 +283,7 @@ export async function createLanguageModel(spec: ProviderModelSpec): Promise<Lang
       name: spec.providerId ?? 'openai-compatible',
       baseURL: baseURL ?? '',
       ...(spec.authType !== 'none' && apiKey.trim() ? { apiKey } : {}),
-      ...(spec.authType === 'none' ? { fetch: fetchWithoutCredentialHeaders } : {}),
+      ...(spec.authType === 'none' ? { fetch: noAuthFetch } : apiKeyFetch ? { fetch: apiKeyFetch } : {}),
       ...(spec.headers ? { headers: spec.headers } : {}),
       ...(spec.compatibility
         ? {
@@ -273,7 +299,7 @@ export async function createLanguageModel(spec: ProviderModelSpec): Promise<Lang
     const create = await loadSdkProviderFactory(npm);
     const provider = create({
       apiKey: spec.authType === 'none' ? '' : apiKey,
-      ...(spec.authType === 'none' ? { fetch: fetchWithoutCredentialHeaders } : {}),
+      ...(spec.authType === 'none' ? { fetch: noAuthFetch } : apiKeyFetch ? { fetch: apiKeyFetch } : {}),
       ...(baseURL ? { baseURL } : {}),
       ...(spec.headers ? { headers: spec.headers } : {}),
     });
