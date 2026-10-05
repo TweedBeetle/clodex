@@ -112,6 +112,18 @@ function generateCertificates(paths: ReturnType<typeof certPaths>): void {
   writePublic(paths.version, CERT_VERSION);
 }
 
+const RENEWAL_BUFFER_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** Valid now, and still valid once the renewal buffer has passed. */
+function staysValid(cert: forge.pki.Certificate, now: number): boolean {
+  return cert.validity.notBefore.getTime() <= now
+    && cert.validity.notAfter.getTime() > now + RENEWAL_BUFFER_MS;
+}
+
+function keyMatchesCertificate(cert: forge.pki.Certificate, key: forge.pki.PrivateKey): boolean {
+  return (cert.publicKey as forge.pki.rsa.PublicKey).n.compareTo((key as forge.pki.rsa.PrivateKey).n) === 0;
+}
+
 /** The stored CA and its key, when both load, pair, and stay valid past the renewal buffer. */
 function loadCurrentCa(
   paths: ReturnType<typeof certPaths>,
@@ -119,14 +131,9 @@ function loadCurrentCa(
   try {
     const caCert = forge.pki.certificateFromPem(readFileSync(paths.caCert, 'utf8'));
     const caKey = forge.pki.privateKeyFromPem(readFileSync(paths.caKey, 'utf8'));
-    const now = Date.now();
-    const renewalBuffer = 7 * 24 * 60 * 60 * 1000;
-    const pub = caCert.publicKey as forge.pki.rsa.PublicKey;
-    const priv = caKey as forge.pki.rsa.PrivateKey;
-    if (caCert.validity.notBefore.getTime() > now) return null;
-    if (caCert.validity.notAfter.getTime() <= now + renewalBuffer) return null;
+    if (!staysValid(caCert, Date.now())) return null;
     if (!caCert.verify(caCert)) return null;
-    if (pub.n.compareTo(priv.n) !== 0) return null;
+    if (!keyMatchesCertificate(caCert, caKey)) return null;
     return { caCert, caKey };
   } catch {
     return null;
@@ -137,14 +144,16 @@ function storedCertificatesAreCurrent(paths: ReturnType<typeof certPaths>): bool
   try {
     const ca = forge.pki.certificateFromPem(readFileSync(paths.caCert, 'utf8'));
     const server = forge.pki.certificateFromPem(readFileSync(paths.serverCert, 'utf8'));
+    const serverKey = forge.pki.privateKeyFromPem(readFileSync(paths.serverKey, 'utf8'));
     const now = Date.now();
-    const renewalBuffer = 7 * 24 * 60 * 60 * 1000;
-    return ca.validity.notBefore.getTime() <= now
-      && ca.validity.notAfter.getTime() > now + renewalBuffer
-      && server.validity.notBefore.getTime() <= now
-      && server.validity.notAfter.getTime() > now + renewalBuffer
+    // Two starts that reissue at once can leave one's key beside the other's certificate, and
+    // the CA signed both, so only the pairing check sees it. Failing here lets the CA-preserving
+    // path repair the store instead of every later start dying on "key values mismatch".
+    return staysValid(ca, now)
+      && staysValid(server, now)
       && ca.verify(ca)
-      && ca.verify(server);
+      && ca.verify(server)
+      && keyMatchesCertificate(server, serverKey);
   } catch {
     return false;
   }
@@ -159,7 +168,7 @@ export function ensureHttpProxyCertificates(): HttpProxyCertificates {
     && storedCertificatesAreCurrent(paths);
   if (!current) {
     // Keep a sound CA (see CERT_VERSION); reissue only what it signs.
-    const ca = required.slice(0, 2).every(existsSync) ? loadCurrentCa(paths) : null;
+    const ca = loadCurrentCa(paths);
     if (ca) {
       generateServerCertificate(paths, ca.caCert, ca.caKey);
       writePublic(paths.version, CERT_VERSION);
