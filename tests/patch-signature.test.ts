@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { signAndVerifyMachOCandidate } from '../src/patch-signature.js';
+import { codesignArgs, signAndVerifyMachOCandidate } from '../src/patch-signature.js';
 
 vi.mock('node:child_process', () => ({ execFileSync: vi.fn() }));
 
@@ -60,5 +60,17 @@ describe('candidate signature', () => {
       signAndVerifyMachOCandidate(binary);
       expect(execFileSync).not.toHaveBeenCalled();
     });
+  });
+
+  it('signs with a stable identity and identifier when configured', () => {
+    expect(codesignArgs('/x/claude', {
+      CLODEX_CODESIGN_IDENTITY: 'Apple Development: Someone (ABC)',
+      CLODEX_CODESIGN_IDENTIFIER: 'com.example.claude-clx',
+    })).toEqual(['-s', 'Apple Development: Someone (ABC)', '-f', '--identifier', 'com.example.claude-clx', '/x/claude']);
+    expect(codesignArgs('/x/claude', { CLODEX_CODESIGN_IDENTITY: 'ID' }))
+      .toEqual(['-s', 'ID', '-f', '/x/claude']);
+    expect(codesignArgs('/x/claude', { CLODEX_CODESIGN_IDENTITY: '  ' }))
+      .toEqual(['-s', '-', '-f', '/x/claude']);
+    expect(codesignArgs('/x/claude', {})).toEqual(['-s', '-', '-f', '/x/claude']);
   });
 });
