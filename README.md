@@ -474,6 +474,9 @@ clodex --version    # version
   deadline counted from when the request arrived: at the deadline clodex drops
   any attempt that has not finished its handshake and answers 502, with a
   message saying the outage hold expired and naming the last upstream error.
+  An attempt can still start after the deadline when a reused connection is
+  reset and clodex replays the request. That replay gets no deadline and
+  behaves exactly as it would with the hold off.
   `CLODEX_PASSTHROUGH_OUTAGE_HOLD_MS` sets the deadline in milliseconds. The
   default is `120000` (2 minutes) and `0` turns the hold off. Values above
   `570000` clamp to it with a one-time warning; malformed values are reported
@@ -488,8 +491,9 @@ clodex --version    # version
   32 KiB of request body for a query's first response headers. After one
   request gets no response, later requests in the query get `API_TIMEOUT_MS`
   minus 1 second (599 seconds at its default), and a second request with no
-  response ends the turn even with retries left. The default hold answers
-  inside the first window, so it never reaches either limit. A hold above about
+  response ends the turn even with retries left. At Claude Code's defaults the
+  default hold answers inside the first window, so a request still waiting for
+  its connection gets its 502 before either limit. A hold above about
   180 seconds means the query's first held request is cut off by Claude Code
   instead, and the hold must then stay below the longer window; the `570000`
   ceiling does that at Claude Code's default `API_TIMEOUT_MS`. If you lower
@@ -499,6 +503,9 @@ clodex --version    # version
   `API_TIMEOUT_MS` − 1 s) + (`API_TIMEOUT_MS` − 1 s); keep the hold below
   `API_TIMEOUT_MS` − 1 s, or set it to `0`. Very short `API_TIMEOUT_MS` values
   turn that watchdog off altogether.
+  The cost is a longer wait when the outage does not end: with the hold off,
+  Claude Code gives up on a persistent fast-failing outage after about 3
+  minutes, and at the default hold after about 25 (both projections).
   The hold has its own switch. `CLODEX_UPSTREAM_MAX_RETRIES=0` and
   `CLAUDE_CODE_MAX_RETRIES=0` do not turn it off, because a held request was
   never sent. If you want outages to fail fast, for example in a headless
