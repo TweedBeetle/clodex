@@ -474,9 +474,9 @@ clodex --version    # version
   deadline counted from when the request arrived: at the deadline clodex drops
   any attempt that has not finished its handshake and answers 502, with a
   message saying the outage hold expired and naming the last upstream error.
-  An attempt can still start after the deadline when a reused connection is
-  reset and clodex replays the request. That replay gets no deadline and
-  behaves exactly as it would with the hold off.
+  If a reused connection is reset after the deadline and clodex replays the
+  request, the replay gets that 502 at once unless it can go out on another
+  reused connection.
   `CLODEX_PASSTHROUGH_OUTAGE_HOLD_MS` sets the deadline in milliseconds. The
   default is `120000` (2 minutes) and `0` turns the hold off. Values above
   `570000` clamp to it with a one-time warning; malformed values are reported
