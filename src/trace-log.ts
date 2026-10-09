@@ -290,7 +290,7 @@ export interface InferenceResponseLifecycleLogEntry {
   reusedSocket?: boolean;
   /** Set on a retry made because the upstream could not be reached at all (outage hold). */
   outageHold?: boolean;
-  /** Milliseconds since the first unreachable attempt of this request. */
+  /** Milliseconds of the outage hold used, counted from the request's arrival. */
   holdElapsedMs?: number;
   /** Delay before the next attempt. */
   retryDelayMs?: number;

@@ -2897,8 +2897,10 @@ describe('selective HTTP proxy', () => {
             expect(entry).toMatchObject({ outageHold: true, reusedSocket: false, phase: 'waiting_for_headers' });
             expect(['ENOTFOUND', 'EAI_AGAIN', 'EAI_FAIL']).toContain(entry['errorType']);
           }
-          // Backoff doubles: 1 s, then the remainder of the budget.
-          expect(retried[0]).toMatchObject({ retryDelayMs: 1_000, holdElapsedMs: 0 });
+          // Backoff doubles: 1 s, then the remainder of the budget. The hold is
+          // counted from the request's arrival, so the first failure is near 0.
+          expect(retried[0]).toMatchObject({ retryDelayMs: 1_000 });
+          expect(retried[0]!['holdElapsedMs']).toBeLessThan(500);
           expect(entries).toContainEqual(expect.objectContaining({ event: 'response_failed', statusCode: 502 }));
         } finally {
           await proxy.close();
