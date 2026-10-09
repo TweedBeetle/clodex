@@ -3208,6 +3208,49 @@ describe('selective HTTP proxy', () => {
         }
       }, 20_000);
 
+      it('never cuts a request whose TLS completed, however long the answer takes', async () => {
+        // Once TLS completes the request bytes can go out, so the deadline stops
+        // there: an origin that answers after the hold budget is still waited for.
+        process.env[HOLD_ENV] = '800';
+        const certificates = ensureHttpProxyCertificates();
+        const bodies: string[] = [];
+        const origin = https.createServer({ key: certificates.serverKey, cert: certificates.serverCert }, (req, res) => {
+          const chunks: Buffer[] = [];
+          req.on('data', (chunk: Buffer) => chunks.push(chunk));
+          req.once('end', () => {
+            bodies.push(Buffer.concat(chunks).toString());
+            setTimeout(() => {
+              res.writeHead(200, {
+                'Content-Type': 'application/json',
+                'Content-Length': String(Buffer.byteLength(ORIGIN_BODY)),
+              });
+              res.end(ORIGIN_BODY);
+            }, 1_600);
+          });
+        });
+        const originPort = await listen(origin);
+        const proxy = await startHttpProxy({
+          routes: [],
+          anthropicOrigin: `https://127.0.0.1:${originPort}`,
+          anthropicRejectUnauthorized: false,
+        });
+        try {
+          const secure = await connectMitm(proxy.port, certificates.caCert);
+          let response = '';
+          secure.on('data', chunk => { response += chunk.toString(); });
+          secure.write(messagesRequest(JSON.stringify({ model: 'claude-opus-4-8', messages: [{ role: 'user', content: 'slow answer' }] })));
+          await awaitResponses(secure, () => response, 1);
+          secure.destroy();
+
+          expect(response).toContain('200 OK');
+          expect(response).not.toContain('502');
+          expect(bodies).toHaveLength(1);
+        } finally {
+          await proxy.close();
+          await new Promise<void>(resolve => origin.close(() => resolve()));
+        }
+      }, 20_000);
+
       it('does not hold a certificate failure', async () => {
         // A TLS verification error is a configuration fault, not an outage, and
         // holding it would only turn a clear error into a silent wait.
