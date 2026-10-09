@@ -582,28 +582,40 @@ function forwardRawAnthropicRequest(
       });
       upstream = request;
       let tlsEstablished = false;
-      // While the hold is on, an attempt still short of TLS is cut off at the
-      // deadline: nothing has been sent, so ending it there is safe, and it also
-      // ends a connect or handshake that never answers at all. It is cleared the
-      // moment TLS completes, so it can never cut a request that went out. An
-      // attempt started after the deadline (a pooled-socket replay late in a
-      // slow request) carries none, exactly as with the hold off.
+      // While the hold is on, every attempt on a fresh socket that has not
+      // completed TLS is bounded by the arrival deadline: nothing has been sent,
+      // so ending it there is safe, and it also ends a connect or handshake that
+      // never answers at all. An attempt started before the deadline carries a
+      // timer to it, cleared the moment TLS completes, so it can never cut a
+      // request that went out. One started at or after the deadline (a
+      // pooled-socket replay late in a slow request) is decided when its socket
+      // arrives: a reused socket goes ahead, a fresh one is answered with the
+      // 502 at once. The reset that led to that replay came before any response,
+      // so nothing was served, and Claude Code resends a 502 itself.
+      const cutPendingAttempt = (): void => {
+        if (tlsEstablished || headersReceived || failed || clientDisconnected) return;
+        answer502(holdExpiredDetail(true), {
+          errorType: 'outage_hold_expired',
+          reusedSocket: false,
+          outageHold: true,
+        });
+        request.destroy();
+      };
       const attemptRemaining = holdDeadline - Date.now();
+      const startedAfterDeadline = outageHoldMs > 0 && attemptRemaining <= 0;
       if (outageHoldMs > 0 && attemptRemaining > 0) {
         attemptDeadlineTimer = setTimeout(() => {
           attemptDeadlineTimer = undefined;
-          if (tlsEstablished || headersReceived || failed || clientDisconnected) return;
-          answer502(holdExpiredDetail(true), {
-            errorType: 'outage_hold_expired',
-            reusedSocket: false,
-            outageHold: true,
-          });
-          request.destroy();
+          cutPendingAttempt();
         }, attemptRemaining);
       }
       request.once('socket', socket => {
         if (request.reusedSocket) {
           clearAttemptDeadline();
+          return;
+        }
+        if (startedAfterDeadline) {
+          cutPendingAttempt();
           return;
         }
         socket.once('secureConnect', () => {

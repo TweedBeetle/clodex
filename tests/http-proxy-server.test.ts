@@ -3251,6 +3251,170 @@ describe('selective HTTP proxy', () => {
         }
       }, 20_000);
 
+      /**
+       * An origin whose first request on any connection is answered after a short
+       * delay. The first request it sees on an already-used connection is held,
+       * unanswered, until `resetAfterMs`, then the raw TCP socket is reset; any
+       * later request on a used connection is answered at once.
+       */
+      function lateResetOrigin(resetAfterMs: number): {
+        server: https.Server;
+        requests: () => number;
+        tlsConnections: () => number;
+        resetAt: () => number | undefined;
+      } {
+        const certificates = ensureHttpProxyCertificates();
+        let requests = 0;
+        let tlsConnections = 0;
+        let resetAt: number | undefined;
+        let reuseSeen = 0;
+        const perConnection = new WeakMap<net.Socket, number>();
+        const rawByPort = new Map<number, net.Socket>();
+        const server = https.createServer({ key: certificates.serverKey, cert: certificates.serverCert }, (req, res) => {
+          req.resume();
+          const seen = (perConnection.get(req.socket) ?? 0) + 1;
+          perConnection.set(req.socket, seen);
+          requests += 1;
+          const answer = (): void => {
+            res.writeHead(200, {
+              'Content-Type': 'application/json',
+              'Content-Length': String(Buffer.byteLength(ORIGIN_BODY)),
+            });
+            res.end(ORIGIN_BODY);
+          };
+          if (seen === 1) {
+            setTimeout(answer, 200);
+            return;
+          }
+          reuseSeen += 1;
+          if (reuseSeen === 1) {
+            const raw = rawByPort.get(req.socket.remotePort ?? -1);
+            setTimeout(() => { resetAt = Date.now(); raw?.resetAndDestroy(); }, resetAfterMs);
+            return;
+          }
+          answer();
+        });
+        server.on('connection', raw => {
+          const port = raw.remotePort;
+          if (port !== undefined) rawByPort.set(port, raw);
+        });
+        server.on('secureConnection', () => { tlsConnections += 1; });
+        return {
+          server,
+          requests: () => requests,
+          tlsConnections: () => tlsConnections,
+          resetAt: () => resetAt,
+        };
+      }
+
+      async function warmPooledSockets(proxyPort: number, ca: string, count: number): Promise<{
+        clients: tls.TLSSocket[];
+        responses: string[];
+      }> {
+        const clients = await Promise.all(Array.from({ length: count }, () => connectMitm(proxyPort, ca)));
+        const responses = clients.map(() => '');
+        clients.forEach((client, i) => client.on('data', chunk => { responses[i] += chunk.toString(); }));
+        clients.forEach((client, i) => client.write(messagesRequest(JSON.stringify({
+          model: 'claude-opus-4-8',
+          messages: [{ role: 'user', content: `warm ${i}` }],
+        }))));
+        await Promise.all(clients.map((client, i) => awaitResponses(client, () => responses[i]!, 1)));
+        return { clients, responses };
+      }
+
+      it('answers 502 at once when a replay after the deadline needs a fresh socket', async () => {
+        // The request goes out on a pooled socket, the origin holds it past the
+        // 1.5 s deadline and then resets it. With no idle socket left, the replay
+        // needs a fresh connection after the deadline, and the hold bounds every
+        // fresh pre-TLS attempt by that deadline, however late it starts.
+        process.env[HOLD_ENV] = '1500';
+        const certificates = ensureHttpProxyCertificates();
+        const inferenceLogPath = join(testHome, 'passthrough-outage-late-replay-fresh.jsonl');
+        const origin = lateResetOrigin(2_000);
+        const originPort = await listen(origin.server);
+        const proxy = await startHttpProxy({
+          routes: [],
+          inferenceLogPath,
+          anthropicOrigin: `https://127.0.0.1:${originPort}`,
+          anthropicRejectUnauthorized: false,
+        });
+        try {
+          const { clients, responses } = await warmPooledSockets(proxy.port, certificates.caCert, 1);
+          expect(origin.tlsConnections()).toBe(1);
+          const before = responses[0]!.length;
+          clients[0]!.write(messagesRequest(JSON.stringify({ model: 'claude-opus-4-8', messages: [{ role: 'user', content: 'late replay' }] })));
+          await awaitUntil(clients[0]!, () => responses[0]!.slice(before).includes('Anthropic upstream unreachable'),
+            () => `expected a 502 body, got: ${responses[0]!.slice(before, before + 400)}`);
+          const answeredAt = Date.now();
+          for (const client of clients) client.destroy();
+
+          const late = responses[0]!.slice(before);
+          expect(late).toContain('HTTP/1.1 502');
+          expect(late).toContain('outage hold of 1500 ms expired before the TLS handshake completed');
+          // Answered as soon as the reset arrived, without waiting on a new connection.
+          expect(answeredAt - origin.resetAt()!).toBeLessThan(300);
+          // No fresh connection completed TLS: the replay never reached the origin.
+          expect(origin.tlsConnections()).toBe(1);
+          expect(origin.requests()).toBe(2);
+          const entries = await readLog(inferenceLogPath);
+          expect(entries).toContainEqual(expect.objectContaining({
+            event: 'response_retried',
+            reusedSocket: true,
+            errorType: 'ECONNRESET',
+          }));
+          expect(entries).toContainEqual(expect.objectContaining({
+            event: 'response_failed',
+            statusCode: 502,
+            errorType: 'outage_hold_expired',
+            outageHold: true,
+            attempt: 2,
+          }));
+        } finally {
+          await proxy.close();
+          await new Promise<void>(resolve => origin.server.close(() => resolve()));
+        }
+      }, 20_000);
+
+      it('lets a replay after the deadline go ahead on a reused socket', async () => {
+        // Same timeline with a second pooled socket left idle: the replay gets a
+        // reused connection, which the hold never cuts, and is answered.
+        process.env[HOLD_ENV] = '1500';
+        const certificates = ensureHttpProxyCertificates();
+        const inferenceLogPath = join(testHome, 'passthrough-outage-late-replay-reused.jsonl');
+        const origin = lateResetOrigin(2_000);
+        const originPort = await listen(origin.server);
+        const proxy = await startHttpProxy({
+          routes: [],
+          inferenceLogPath,
+          anthropicOrigin: `https://127.0.0.1:${originPort}`,
+          anthropicRejectUnauthorized: false,
+        });
+        try {
+          const { clients, responses } = await warmPooledSockets(proxy.port, certificates.caCert, 2);
+          expect(origin.tlsConnections()).toBe(2);
+          const before = responses[0]!.length;
+          const sentAt = Date.now();
+          clients[0]!.write(messagesRequest(JSON.stringify({ model: 'claude-opus-4-8', messages: [{ role: 'user', content: 'late replay' }] })));
+          await awaitUntil(clients[0]!, () => responses[0]!.slice(before).includes(ORIGIN_BODY),
+            () => `expected the replay's answer, got: ${responses[0]!.slice(before, before + 400)}`);
+          const answeredMs = Date.now() - sentAt;
+          for (const client of clients) client.destroy();
+
+          expect(responses[0]!.slice(before)).toContain('200 OK');
+          expect(responses[0]!.slice(before)).not.toContain('502');
+          // Answered after the deadline, on the second pooled connection.
+          expect(answeredMs).toBeGreaterThanOrEqual(1_900);
+          expect(origin.tlsConnections()).toBe(2);
+          expect(origin.requests()).toBe(4);
+          const entries = await readLog(inferenceLogPath);
+          expect(entries.some(entry => entry['event'] === 'response_failed')).toBe(false);
+          expect(entries).toContainEqual(expect.objectContaining({ event: 'response_completed', attempt: 2 }));
+        } finally {
+          await proxy.close();
+          await new Promise<void>(resolve => origin.server.close(() => resolve()));
+        }
+      }, 20_000);
+
       it('does not hold a certificate failure', async () => {
         // A TLS verification error is a configuration fault, not an outage, and
         // holding it would only turn a clear error into a silent wait.
