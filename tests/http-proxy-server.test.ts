@@ -2830,6 +2830,76 @@ describe('selective HTTP proxy', () => {
       }
     }, 20_000);
 
+    it('replays a reset pooled socket only as often as the retry budget allows', async () => {
+      // Three pooled sockets that the origin resets on reuse. With one replay
+      // allowed, the request fails on the second reset; an unbounded replay
+      // would walk every pooled socket and then succeed on a fresh one.
+      const certificates = ensureHttpProxyCertificates();
+      const inferenceLogPath = join(testHome, 'passthrough-retry-bounded.jsonl');
+      let requests = 0;
+      const perConnection = new WeakMap<net.Socket, number>();
+      const origin = https.createServer({
+        key: certificates.serverKey,
+        cert: certificates.serverCert,
+      }, (req, res) => {
+        req.resume();
+        const seen = (perConnection.get(req.socket) ?? 0) + 1;
+        perConnection.set(req.socket, seen);
+        requests += 1;
+        if (seen > 1) {
+          req.socket.destroy();
+          return;
+        }
+        // Slow enough that the three warm-up requests each open their own socket.
+        setTimeout(() => {
+          res.writeHead(200, {
+            'Content-Type': 'application/json',
+            'Content-Length': String(Buffer.byteLength(ORIGIN_BODY)),
+          });
+          res.end(ORIGIN_BODY);
+        }, 300);
+      });
+      const originPort = await listen(origin);
+      const proxy = await startHttpProxy({
+        routes: [],
+        inferenceLogPath,
+        anthropicOrigin: `https://127.0.0.1:${originPort}`,
+        anthropicRejectUnauthorized: false,
+      });
+      try {
+        const clients = await Promise.all([0, 1, 2].map(() => connectMitm(proxy.port, certificates.caCert)));
+        const responses = clients.map(() => '');
+        clients.forEach((client, i) => client.on('data', chunk => { responses[i] += chunk.toString(); }));
+        clients.forEach((client, i) => client.write(messagesRequest(JSON.stringify({
+          model: 'claude-opus-4-8',
+          messages: [{ role: 'user', content: `warm ${i}` }],
+        }))));
+        await Promise.all(clients.map((client, i) => awaitResponses(client, () => responses[i]!, 1)));
+        expect(requests).toBe(3);
+
+        clients[0]!.write(messagesRequest(JSON.stringify({
+          model: 'claude-opus-4-8',
+          messages: [{ role: 'user', content: 'on a pooled socket' }],
+        })));
+        await awaitStatus502(clients[0]!, () => responses[0]!);
+        for (const client of clients) client.destroy();
+
+        // Three warm-ups, the reset attempt, and exactly one replay.
+        expect(requests).toBe(5);
+        const entries = await readLog(inferenceLogPath);
+        expect(entries.filter(entry => entry['event'] === 'response_retried')).toHaveLength(1);
+        expect(entries).toContainEqual(expect.objectContaining({
+          event: 'response_failed',
+          errorType: 'ECONNRESET',
+          attempt: 2,
+          reusedSocket: true,
+        }));
+      } finally {
+        await proxy.close();
+        await new Promise<void>(resolve => origin.close(() => resolve()));
+      }
+    }, 20_000);
+
     describe('outage hold', () => {
       const HOLD_ENV = 'CLODEX_PASSTHROUGH_OUTAGE_HOLD_MS';
       let previousHold: string | undefined;
@@ -2866,47 +2936,396 @@ describe('selective HTTP proxy', () => {
         return port;
       }
 
+      /** A resolver that fails every lookup with `code`, so DNS tests stay hermetic. */
+      function failingLookup(code: string): { lookup: net.LookupFunction; calls: () => number } {
+        let calls = 0;
+        const lookup = ((
+          hostname: string,
+          _options: unknown,
+          callback: (err: NodeJS.ErrnoException | null, address: string, family: number) => void,
+        ) => {
+          calls += 1;
+          const err: NodeJS.ErrnoException = Object.assign(
+            new Error(`getaddrinfo ${code} ${hostname}`),
+            { code, syscall: 'getaddrinfo', hostname },
+          );
+          process.nextTick(() => callback(err, '', 0));
+        }) as unknown as net.LookupFunction;
+        return { lookup, calls: () => calls };
+      }
+
+      /** A TCP origin that never answers TLS; `onConnection` decides what each connection does. */
+      async function rawOrigin(onConnection: (socket: net.Socket) => void): Promise<{
+        port: number;
+        connections: () => number;
+        close: () => Promise<void>;
+      }> {
+        const sockets: net.Socket[] = [];
+        const server = net.createServer(socket => {
+          sockets.push(socket);
+          socket.on('error', () => {});
+          // Discard the ClientHello; a paused socket never reports the close.
+          socket.resume();
+          onConnection(socket);
+        });
+        const port = await listen(server);
+        return {
+          port,
+          connections: () => sockets.length,
+          close: async () => {
+            for (const socket of sockets) socket.destroy();
+            await new Promise<void>(resolve => server.close(() => resolve()));
+          },
+        };
+      }
+
+      /** Send one messages request and time it to its 502. */
+      async function heldRequestTo502(proxyPort: number, ca: string, content: string): Promise<{
+        response: string;
+        heldMs: number;
+      }> {
+        const secure = await connectMitm(proxyPort, ca);
+        let response = '';
+        secure.on('data', chunk => { response += chunk.toString(); });
+        const sentAt = Date.now();
+        secure.write(messagesRequest(JSON.stringify({ model: 'claude-opus-4-8', messages: [{ role: 'user', content }] })));
+        await awaitStatus502(secure, () => response);
+        const heldMs = Date.now() - sentAt;
+        secure.destroy();
+        expect(response).toContain('HTTP/1.1 502');
+        return { response, heldMs };
+      }
+
       it('holds a request whose upstream name does not resolve, then answers 502 when the hold is spent', async () => {
-        // A simulated DNS outage: `.invalid` never resolves (RFC 6761).
+        // A simulated DNS outage, hermetic: the injected resolver fails every
+        // lookup, so the host's own resolver cannot change the result.
         process.env[HOLD_ENV] = '2500';
         const certificates = ensureHttpProxyCertificates();
         const inferenceLogPath = join(testHome, 'passthrough-outage-dns.jsonl');
+        const resolver = failingLookup('ENOTFOUND');
         const proxy = await startHttpProxy({
           routes: [],
           inferenceLogPath,
           anthropicOrigin: 'https://clodex-outage-test.invalid',
           anthropicRejectUnauthorized: false,
+          anthropicLookup: resolver.lookup,
         });
         try {
-          const secure = await connectMitm(proxy.port, certificates.caCert);
-          let response = '';
-          secure.on('data', chunk => { response += chunk.toString(); });
-          const sentAt = Date.now();
-          secure.write(messagesRequest(JSON.stringify({ model: 'claude-opus-4-8', messages: [{ role: 'user', content: 'dns' }] })));
-          await awaitStatus502(secure, () => response);
-          const heldMs = Date.now() - sentAt;
-          secure.destroy();
+          const { response, heldMs } = await heldRequestTo502(proxy.port, certificates.caCert, 'dns');
 
-          // Held for the whole budget rather than failing in milliseconds.
+          // Held for the whole budget rather than failing in milliseconds, and
+          // no longer than it.
           expect(heldMs).toBeGreaterThanOrEqual(2_400);
-          expect(response).toContain('Anthropic upstream unreachable');
+          expect(heldMs).toBeLessThan(3_300);
+          expect(response).toContain('Anthropic upstream unreachable: outage hold of 2500 ms expired');
+          expect(response).toContain('last upstream error: getaddrinfo ENOTFOUND');
           const entries = await readLog(inferenceLogPath);
           const retried = entries.filter(entry => entry['event'] === 'response_retried');
           expect(retried.length).toBeGreaterThanOrEqual(2);
+          expect(resolver.calls()).toBe(retried.length);
           for (const entry of retried) {
-            expect(entry).toMatchObject({ outageHold: true, reusedSocket: false, phase: 'waiting_for_headers' });
-            expect(['ENOTFOUND', 'EAI_AGAIN', 'EAI_FAIL']).toContain(entry['errorType']);
+            expect(entry).toMatchObject({
+              outageHold: true,
+              reusedSocket: false,
+              phase: 'waiting_for_headers',
+              errorType: 'ENOTFOUND',
+            });
           }
           // Backoff doubles: 1 s, then the remainder of the budget. The hold is
           // counted from the request's arrival, so the first failure is near 0.
           expect(retried[0]).toMatchObject({ retryDelayMs: 1_000 });
           expect(retried[0]!['holdElapsedMs']).toBeLessThan(500);
-          expect(entries).toContainEqual(expect.objectContaining({ event: 'response_failed', statusCode: 502 }));
+          expect(entries).toContainEqual(expect.objectContaining({
+            event: 'response_failed',
+            statusCode: 502,
+            outageHold: true,
+          }));
         } finally {
           await proxy.close();
         }
       }, 20_000);
 
+      it('backs off 1 s then 2 s, and cuts the last wait to the deadline', async () => {
+        // 4 s budget: attempts at 0, 1 and 3 s, then the third wait is cut from
+        // 4 s to the ~1 s left and the 502 arrives at the deadline. Also pins
+        // ETIMEDOUT, the timeout class, as a failure that is held.
+        process.env[HOLD_ENV] = '4000';
+        const certificates = ensureHttpProxyCertificates();
+        const inferenceLogPath = join(testHome, 'passthrough-outage-backoff.jsonl');
+        const resolver = failingLookup('ETIMEDOUT');
+        const proxy = await startHttpProxy({
+          routes: [],
+          inferenceLogPath,
+          anthropicOrigin: 'https://clodex-outage-test.invalid',
+          anthropicRejectUnauthorized: false,
+          anthropicLookup: resolver.lookup,
+        });
+        try {
+          const { heldMs } = await heldRequestTo502(proxy.port, certificates.caCert, 'backoff');
+
+          expect(heldMs).toBeGreaterThanOrEqual(3_900);
+          expect(heldMs).toBeLessThan(4_700);
+          expect(resolver.calls()).toBe(3);
+          const retried = (await readLog(inferenceLogPath))
+            .filter(entry => entry['event'] === 'response_retried');
+          expect(retried.map(entry => entry['errorType'])).toEqual(['ETIMEDOUT', 'ETIMEDOUT', 'ETIMEDOUT']);
+          expect(retried[0]!['retryDelayMs']).toBe(1_000);
+          expect(retried[1]!['retryDelayMs']).toBe(2_000);
+          expect(retried[2]!['retryDelayMs']).toBeGreaterThan(700);
+          expect(retried[2]!['retryDelayMs']).toBeLessThanOrEqual(1_000);
+        } finally {
+          await proxy.close();
+        }
+      }, 20_000);
+
+      it('answers at the deadline when each connect takes long to fail', async () => {
+        // The origin accepts TCP, waits 2.5 s, then resets before TLS. With a
+        // 3 s hold the 502 must arrive at ~3 s: the hold is counted from the
+        // request's arrival and is not restarted by a slow failure.
+        process.env[HOLD_ENV] = '3000';
+        const certificates = ensureHttpProxyCertificates();
+        const inferenceLogPath = join(testHome, 'passthrough-outage-slow.jsonl');
+        const origin = await rawOrigin(socket => {
+          setTimeout(() => socket.resetAndDestroy(), 2_500);
+        });
+        const proxy = await startHttpProxy({
+          routes: [],
+          inferenceLogPath,
+          anthropicOrigin: `https://127.0.0.1:${origin.port}`,
+          anthropicRejectUnauthorized: false,
+        });
+        try {
+          const { response, heldMs } = await heldRequestTo502(proxy.port, certificates.caCert, 'slow');
+
+          expect(heldMs).toBeGreaterThanOrEqual(2_900);
+          expect(heldMs).toBeLessThan(4_000);
+          expect(response).toContain('outage hold of 3000 ms expired');
+          expect(origin.connections()).toBe(1);
+          const retried = (await readLog(inferenceLogPath))
+            .filter(entry => entry['event'] === 'response_retried');
+          expect(retried).toEqual([expect.objectContaining({ outageHold: true, errorType: 'ECONNRESET' })]);
+        } finally {
+          await proxy.close();
+          await origin.close();
+        }
+      }, 20_000);
+
+      it('ends an attempt whose TLS handshake never answers at the deadline', async () => {
+        process.env[HOLD_ENV] = '1500';
+        const certificates = ensureHttpProxyCertificates();
+        const inferenceLogPath = join(testHome, 'passthrough-outage-silent-tls.jsonl');
+        const closedByProxy: Promise<unknown>[] = [];
+        const origin = await rawOrigin(socket => { closedByProxy.push(once(socket, 'close')); });
+        const proxy = await startHttpProxy({
+          routes: [],
+          inferenceLogPath,
+          anthropicOrigin: `https://127.0.0.1:${origin.port}`,
+          anthropicRejectUnauthorized: false,
+        });
+        try {
+          const { response, heldMs } = await heldRequestTo502(proxy.port, certificates.caCert, 'silent tls');
+
+          expect(heldMs).toBeGreaterThanOrEqual(1_400);
+          expect(heldMs).toBeLessThan(2_500);
+          expect(response).toContain('outage hold of 1500 ms expired before the TLS handshake completed');
+          expect(response).not.toContain('last upstream error');
+          expect(origin.connections()).toBe(1);
+          // The pending attempt is torn down, not left open behind the 502.
+          await Promise.race([
+            Promise.all(closedByProxy),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('attempt left open')), 2_000)),
+          ]);
+          expect((await readLog(inferenceLogPath))).toContainEqual(expect.objectContaining({
+            event: 'response_failed',
+            statusCode: 502,
+            errorType: 'outage_hold_expired',
+            outageHold: true,
+          }));
+        } finally {
+          await proxy.close();
+          await origin.close();
+        }
+      }, 20_000);
+
+      it('holds a fresh socket that is reset before TLS completes', async () => {
+        process.env[HOLD_ENV] = '2500';
+        const certificates = ensureHttpProxyCertificates();
+        const inferenceLogPath = join(testHome, 'passthrough-outage-reset-before-tls.jsonl');
+        const origin = await rawOrigin(socket => socket.resetAndDestroy());
+        const proxy = await startHttpProxy({
+          routes: [],
+          inferenceLogPath,
+          anthropicOrigin: `https://127.0.0.1:${origin.port}`,
+          anthropicRejectUnauthorized: false,
+        });
+        try {
+          const { heldMs } = await heldRequestTo502(proxy.port, certificates.caCert, 'reset before tls');
+
+          expect(heldMs).toBeGreaterThanOrEqual(2_400);
+          expect(origin.connections()).toBeGreaterThanOrEqual(2);
+          const retried = (await readLog(inferenceLogPath))
+            .filter(entry => entry['event'] === 'response_retried');
+          // Every failed attempt is held; the last wait ends at the deadline.
+          expect(retried.length).toBe(origin.connections());
+          for (const entry of retried) {
+            expect(entry).toMatchObject({ outageHold: true, reusedSocket: false, errorType: 'ECONNRESET' });
+          }
+        } finally {
+          await proxy.close();
+          await origin.close();
+        }
+      }, 20_000);
+
+      it('answers 502 at once, with one request seen, when a fresh socket is reset after TLS', async () => {
+        // The request bytes go out once TLS completes, so a reset after that may
+        // follow a request the origin received. The hold must not retry it.
+        process.env[HOLD_ENV] = '3000';
+        const certificates = ensureHttpProxyCertificates();
+        const inferenceLogPath = join(testHome, 'passthrough-outage-reset-after-tls.jsonl');
+        const { server, requestCount } = resettingOrigin(1);
+        const originPort = await listen(server);
+        const proxy = await startHttpProxy({
+          routes: [],
+          inferenceLogPath,
+          anthropicOrigin: `https://127.0.0.1:${originPort}`,
+          anthropicRejectUnauthorized: false,
+        });
+        try {
+          const { heldMs } = await heldRequestTo502(proxy.port, certificates.caCert, 'reset after tls');
+
+          expect(heldMs).toBeLessThan(900);
+          expect(requestCount()).toBe(1);
+          const entries = await readLog(inferenceLogPath);
+          expect(entries.some(entry => entry['event'] === 'response_retried')).toBe(false);
+          expect(entries).toContainEqual(expect.objectContaining({
+            event: 'response_failed',
+            errorType: 'ECONNRESET',
+            reusedSocket: false,
+          }));
+        } finally {
+          await proxy.close();
+          await new Promise<void>(resolve => server.close(() => resolve()));
+        }
+      }, 20_000);
+
+      it('does not hold a certificate failure', async () => {
+        // A TLS verification error is a configuration fault, not an outage, and
+        // holding it would only turn a clear error into a silent wait.
+        process.env[HOLD_ENV] = '3000';
+        const certificates = ensureHttpProxyCertificates();
+        const inferenceLogPath = join(testHome, 'passthrough-outage-cert.jsonl');
+        const { server } = okOrigin();
+        let connections = 0;
+        server.on('connection', () => { connections += 1; });
+        const originPort = await listen(server);
+        const proxy = await startHttpProxy({
+          routes: [],
+          inferenceLogPath,
+          anthropicOrigin: `https://127.0.0.1:${originPort}`,
+          anthropicRejectUnauthorized: true,
+        });
+        try {
+          const { heldMs } = await heldRequestTo502(proxy.port, certificates.caCert, 'cert');
+
+          expect(heldMs).toBeLessThan(900);
+          expect(connections).toBe(1);
+          const entries = await readLog(inferenceLogPath);
+          expect(entries.some(entry => entry['event'] === 'response_retried')).toBe(false);
+        } finally {
+          await proxy.close();
+          await new Promise<void>(resolve => server.close(() => resolve()));
+        }
+      }, 20_000);
+
+      it.each([
+        ['count_tokens', 'POST', '/v1/messages/count_tokens'],
+        ['an OAuth call', 'GET', '/api/oauth/profile'],
+        ['telemetry', 'POST', '/api/event_logging/batch'],
+      ])('does not hold %s', async (_name, method, path) => {
+        process.env[HOLD_ENV] = '3000';
+        const certificates = ensureHttpProxyCertificates();
+        const resolver = failingLookup('ENOTFOUND');
+        const proxy = await startHttpProxy({
+          routes: [],
+          anthropicOrigin: `https://127.0.0.1:${await freePort()}`,
+          anthropicRejectUnauthorized: false,
+          anthropicLookup: resolver.lookup,
+        });
+        try {
+          const secure = await connectMitm(proxy.port, certificates.caCert);
+          let response = '';
+          secure.on('data', chunk => { response += chunk.toString(); });
+          const body = method === 'GET'
+            ? ''
+            : JSON.stringify({ model: 'claude-opus-4-8', messages: [{ role: 'user', content: 'aux' }] });
+          const sentAt = Date.now();
+          secure.write([
+            `${method} ${path} HTTP/1.1`,
+            'Host: api.anthropic.com',
+            'Content-Type: application/json',
+            `Content-Length: ${Buffer.byteLength(body)}`,
+            'Connection: keep-alive',
+            '',
+            '',
+          ].join('\r\n') + body);
+          await awaitStatus502(secure, () => response);
+          expect(Date.now() - sentAt).toBeLessThan(900);
+          secure.destroy();
+        } finally {
+          await proxy.close();
+        }
+      }, 20_000);
+
+      it('still replays a pooled socket that resets after the hold has retried', async () => {
+        // The pooled-socket replay has its own budget. Counting it on the shared
+        // attempt number would spend it on the hold's retries and turn a
+        // recoverable stale socket into a 502.
+        process.env[HOLD_ENV] = '10000';
+        const certificates = ensureHttpProxyCertificates();
+        const inferenceLogPath = join(testHome, 'passthrough-outage-then-reuse.jsonl');
+        const port = await freePort();
+        const { server, requestCount } = resettingOrigin(2);
+        const proxy = await startHttpProxy({
+          routes: [],
+          inferenceLogPath,
+          anthropicOrigin: `https://127.0.0.1:${port}`,
+          anthropicRejectUnauthorized: false,
+        });
+        try {
+          const held = await connectMitm(proxy.port, certificates.caCert);
+          let heldResponse = '';
+          held.on('data', chunk => { heldResponse += chunk.toString(); });
+          held.write(messagesRequest(JSON.stringify({ model: 'claude-opus-4-8', messages: [{ role: 'user', content: 'held' }] })));
+          // The first attempt is refused; the hold retries at 1 s. Bring the
+          // origin up and pool one socket with another request before then, so
+          // the retry is handed that socket, which the origin then resets.
+          await new Promise(resolve => setTimeout(resolve, 200));
+          server.listen(port, '127.0.0.1');
+          await once(server, 'listening');
+          const other = await connectMitm(proxy.port, certificates.caCert);
+          let otherResponse = '';
+          other.on('data', chunk => { otherResponse += chunk.toString(); });
+          other.write(messagesRequest(JSON.stringify({ model: 'claude-opus-4-8', messages: [{ role: 'user', content: 'pool' }] })));
+          await awaitResponses(other, () => otherResponse, 1);
+          await awaitResponses(held, () => heldResponse, 1);
+          held.destroy();
+          other.destroy();
+
+          expect(heldResponse).toContain('200 OK');
+          // The pooling request, the held request's reset on the pooled socket,
+          // and its replay on a fresh one.
+          expect(requestCount()).toBe(3);
+          const retried = (await readLog(inferenceLogPath))
+            .filter(entry => entry['event'] === 'response_retried');
+          expect(retried).toEqual([
+            expect.objectContaining({ outageHold: true, errorType: 'ECONNREFUSED', attempt: 1 }),
+            expect.objectContaining({ reusedSocket: true, errorType: 'ECONNRESET', attempt: 2 }),
+          ]);
+        } finally {
+          await proxy.close();
+          await new Promise<void>(resolve => server.close(() => resolve()));
+        }
+      }, 20_000);
       it('delivers the request once, unchanged, when the upstream comes back during the hold', async () => {
         process.env[HOLD_ENV] = '10000';
         const certificates = ensureHttpProxyCertificates();
@@ -2977,28 +3396,33 @@ describe('selective HTTP proxy', () => {
       }, 20_000);
 
       it('stops retrying when the client gives up during the hold', async () => {
+        // Counts connections at the origin, not log lines: an attempt made after
+        // the client left logs nothing, so only the origin can see it.
         process.env[HOLD_ENV] = '10000';
         const certificates = ensureHttpProxyCertificates();
         const inferenceLogPath = join(testHome, 'passthrough-outage-abandon.jsonl');
+        const origin = await rawOrigin(socket => socket.resetAndDestroy());
         const proxy = await startHttpProxy({
           routes: [],
           inferenceLogPath,
-          anthropicOrigin: `https://127.0.0.1:${await freePort()}`,
+          anthropicOrigin: `https://127.0.0.1:${origin.port}`,
           anthropicRejectUnauthorized: false,
         });
         try {
           const secure = await connectMitm(proxy.port, certificates.caCert);
           secure.write(messagesRequest(JSON.stringify({ model: 'claude-opus-4-8', messages: [{ role: 'user', content: 'abandon' }] })));
+          // Attempts at 0 and 1 s; the next would be at 3 s, then 7 s.
           await new Promise(resolve => setTimeout(resolve, 1_500));
+          expect(origin.connections()).toBe(2);
           secure.destroy();
-          await new Promise(resolve => setTimeout(resolve, 200));
-          const retriedBefore = (await readLog(inferenceLogPath)).filter(entry => entry['event'] === 'response_retried').length;
-          await new Promise(resolve => setTimeout(resolve, 4_000));
+          await new Promise(resolve => setTimeout(resolve, 4_500));
+          expect(origin.connections()).toBe(2);
           const entries = await readLog(inferenceLogPath);
-          expect(entries.filter(entry => entry['event'] === 'response_retried').length).toBe(retriedBefore);
+          expect(entries.filter(entry => entry['event'] === 'response_retried')).toHaveLength(2);
           expect(entries).toContainEqual(expect.objectContaining({ event: 'response_client_disconnected' }));
         } finally {
           await proxy.close();
+          await origin.close();
         }
       }, 20_000);
     });
