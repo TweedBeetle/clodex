@@ -642,7 +642,13 @@ function forwardRawAnthropicRequest(
             return;
           }
           outageRetries += 1;
-          const holdDelay = Math.min(outageRetryDelayMs(outageRetries), remaining);
+          const backoff = outageRetryDelayMs(outageRetries);
+          const holdDelay = Math.min(backoff, remaining);
+          // A wait cut to the deadline ends the hold when it fires. Do not
+          // re-read the clock: Node's timer clock and Date.now() round
+          // differently, so the callback can run a millisecond short of the
+          // deadline and a recheck would start one more, unnecessary, attempt.
+          const waitReachesDeadline = backoff >= remaining;
           writeLifecycle('response_retried', {
             phase: responsePhase(),
             durationMs: now - startedAt,
@@ -663,7 +669,7 @@ function forwardRawAnthropicRequest(
               done();
               return;
             }
-            if (Date.now() >= holdDeadline) {
+            if (waitReachesDeadline || Date.now() >= holdDeadline) {
               answer502(holdExpiredDetail(false), {
                 errorType: errorType(err),
                 reusedSocket: false,
