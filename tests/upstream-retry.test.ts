@@ -782,7 +782,7 @@ describe('passthroughOutageHoldMs', () => {
     );
   });
 
-  it('clamps a hold that would outlast the escalated header wait, and says so', () => {
+  it('clamps a hold to stay inside the escalated header wait, and says so', () => {
     const warn = vi.fn();
 
     expect(passthroughOutageHoldMs({ [PASSTHROUGH_OUTAGE_HOLD_ENV]: '600000' }, warn))
@@ -792,7 +792,7 @@ describe('passthroughOutageHoldMs', () => {
     expect(warn.mock.calls[0]![0]).toContain(
       `clamping ${PASSTHROUGH_OUTAGE_HOLD_ENV}=600000 to 570000ms`,
     );
-    expect(warn.mock.calls[0]![0]).toContain('599 s');
+    expect(warn.mock.calls[0]![0]).toContain('29 s inside the 599 s');
   });
 });
 

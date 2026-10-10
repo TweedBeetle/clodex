@@ -259,14 +259,15 @@ export const PASSTHROUGH_OUTAGE_HOLD_ENV = 'CLODEX_PASSTHROUGH_OUTAGE_HOLD_MS';
  * headers, not CLAUDE_STREAM_IDLE_TIMEOUT_MS (that watchdog is armed only once
  * headers arrive). The first request of a query gets 180 s plus 1 s per 32 KiB
  * of body. After a request gets no response, later requests in that query get
- * the SDK deadline, API_TIMEOUT_MS - 1 s (599 s at defaults), and a second
- * no-response ends the query with retries unused.
+ * API_TIMEOUT_MS - 1 s (599 s at defaults), and a second no-response ends the
+ * query with retries unused.
  *
- * The 120 s default answers inside that first window, so a held request never
- * trips either limit and Claude Code's own retry loop keeps running. Above
- * about 180 s the query's first held request is cut by the client instead, and
- * the hold must then stay below the escalated window; the 570 s ceiling keeps
- * it there at Claude Code's default API_TIMEOUT_MS. `0` turns the hold off.
+ * At Claude Code's defaults the 120 s default hold answers inside that first
+ * window, so a held request never trips either limit and Claude Code's own
+ * retry loop keeps running. Above about 180 s the query's first held request is
+ * cut by the client instead, and the hold must then stay below the escalated
+ * window; the 570 s ceiling keeps it there at Claude Code's default
+ * API_TIMEOUT_MS. `0` turns the hold off.
  */
 export const DEFAULT_PASSTHROUGH_OUTAGE_HOLD_MS = 120_000;
 export const MAX_PASSTHROUGH_OUTAGE_HOLD_MS = 570_000;
@@ -290,8 +291,8 @@ export function passthroughOutageHoldMs(
     reportOnce(
       `${PASSTHROUGH_OUTAGE_HOLD_ENV}=${raw}`,
       `clamping ${PASSTHROUGH_OUTAGE_HOLD_ENV}=${raw} to ${MAX_PASSTHROUGH_OUTAGE_HOLD_MS}ms `
-      + "(a longer hold would outlast the 599 s Claude Code waits for response headers "
-      + 'after a request has gone unanswered, at its default API_TIMEOUT_MS)',
+      + '(the ceiling keeps the hold 29 s inside the 599 s Claude Code waits for response '
+      + 'headers after a request has gone unanswered, at its default API_TIMEOUT_MS)',
       warn,
     );
     return MAX_PASSTHROUGH_OUTAGE_HOLD_MS;
