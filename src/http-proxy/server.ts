@@ -518,7 +518,19 @@ function forwardRawAnthropicRequest(
       return parts.join('; ');
     };
 
-    const sendAttempt = (): void => {
+    // A replay of a reset reused connection that starts after the deadline is
+    // cut by the deadline alone, with no connect failure behind it, so its 502
+    // names the reset rather than reporting an outage.
+    const lateReplayDetail = (): string => {
+      const parts = [
+        `reused connection was reset after the outage hold of ${outageHoldMs} ms had expired, `
+        + 'so the request was not resent on a new connection',
+      ];
+      if (lastHoldError) parts.push(`last upstream error: ${upstreamUnreachableDetail(lastHoldError)}`);
+      return parts.join('; ');
+    };
+
+    const sendAttempt = (replayOfReset = false): void => {
       attempt += 1;
       const request = https.request({
         protocol: 'https:',
@@ -592,9 +604,9 @@ function forwardRawAnthropicRequest(
       // arrives: a reused socket goes ahead, a fresh one is answered with the
       // 502 at once. The reset that led to that replay came before any response,
       // so nothing was served, and Claude Code resends a 502 itself.
-      const cutPendingAttempt = (): void => {
+      const cutPendingAttempt = (lateReplay: boolean): void => {
         if (tlsEstablished || headersReceived || failed || clientDisconnected) return;
-        answer502(holdExpiredDetail(true), {
+        answer502(lateReplay ? lateReplayDetail() : holdExpiredDetail(true), {
           errorType: 'outage_hold_expired',
           reusedSocket: false,
           outageHold: true,
@@ -606,7 +618,7 @@ function forwardRawAnthropicRequest(
       if (outageHoldMs > 0 && attemptRemaining > 0) {
         attemptDeadlineTimer = setTimeout(() => {
           attemptDeadlineTimer = undefined;
-          cutPendingAttempt();
+          cutPendingAttempt(false);
         }, attemptRemaining);
       }
       request.once('socket', socket => {
@@ -615,7 +627,7 @@ function forwardRawAnthropicRequest(
           return;
         }
         if (startedAfterDeadline) {
-          cutPendingAttempt();
+          cutPendingAttempt(replayOfReset);
           return;
         }
         socket.once('secureConnect', () => {
@@ -695,7 +707,7 @@ function forwardRawAnthropicRequest(
             reusedSocket: true,
           });
           lastActivityAt = retriedAt;
-          sendAttempt();
+          sendAttempt(true);
           return;
         }
         if (failed) {

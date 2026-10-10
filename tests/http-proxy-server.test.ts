@@ -1156,6 +1156,48 @@ describe('selective HTTP proxy', () => {
     }
   });
 
+  it('keeps both raw passthrough agents unbounded, so no request waits for a socket', async () => {
+    // The outage hold treats an attempt as unsent unless its socket was reused
+    // or finished TLS. A bounded agent can queue a request and later hand it an
+    // already-used socket that reports `reusedSocket: false` and never fires
+    // `secureConnect`, so the hold deadline could cut a request already sent.
+    // Each agent is captured as the one the proxy destroys on close: the agent
+    // its passthrough really used. HttpsProxyAgent is spied on separately
+    // because an earlier spy's restore can leave it an own `destroy`.
+    const destroys = [
+      vi.spyOn(http.Agent.prototype, 'destroy'),
+      vi.spyOn(HttpsProxyAgent.prototype, 'destroy'),
+    ];
+    const passthroughAgent = async (httpsProxy?: string): Promise<http.Agent> => {
+      const restoreProxyEnv = replaceOutboundProxyEnv(httpsProxy);
+      for (const destroy of destroys) destroy.mockClear();
+      try {
+        const proxy = await startHttpProxy({ routes: [] });
+        await proxy.close();
+        const destroyed = new Set(destroys.flatMap(destroy => destroy.mock.contexts as http.Agent[]));
+        expect(destroyed.size).toBe(1);
+        return [...destroyed][0]!;
+      } finally {
+        restoreProxyEnv();
+      }
+    };
+
+    try {
+      const direct = await passthroughAgent();
+      const proxied = await passthroughAgent('http://127.0.0.1:9');
+
+      expect(direct).toBeInstanceOf(https.Agent);
+      expect(direct).not.toBeInstanceOf(HttpsProxyAgent);
+      expect(proxied).toBeInstanceOf(HttpsProxyAgent);
+      for (const agent of [direct, proxied]) {
+        expect(agent.maxSockets).toBe(Infinity);
+        expect(agent.maxTotalSockets).toBe(Infinity);
+      }
+    } finally {
+      for (const destroy of destroys) destroy.mockRestore();
+    }
+  });
+
   it('logs Haiku passthrough status, error body, and system fallback preview', async () => {
     const certificates = ensureHttpProxyCertificates();
     const inferenceLogPath = join(testHome, 'haiku-error-inference.jsonl');
@@ -2381,9 +2423,9 @@ describe('selective HTTP proxy', () => {
       return { server, requestCount: () => requests, bodies };
     }
 
-    function messagesRequest(body: string): string {
+    function messagesRequest(body: string, path = '/v1/messages'): string {
       return [
-        'POST /v1/messages HTTP/1.1',
+        `POST ${path} HTTP/1.1`,
         'Host: api.anthropic.com',
         'Content-Type: application/json',
         `Content-Length: ${Buffer.byteLength(body)}`,
@@ -2980,7 +3022,7 @@ describe('selective HTTP proxy', () => {
       }
 
       /** Send one messages request and time it to its 502. */
-      async function heldRequestTo502(proxyPort: number, ca: string, content: string): Promise<{
+      async function heldRequestTo502(proxyPort: number, ca: string, content: string, path?: string): Promise<{
         response: string;
         heldMs: number;
       }> {
@@ -2988,7 +3030,10 @@ describe('selective HTTP proxy', () => {
         let response = '';
         secure.on('data', chunk => { response += chunk.toString(); });
         const sentAt = Date.now();
-        secure.write(messagesRequest(JSON.stringify({ model: 'claude-opus-4-8', messages: [{ role: 'user', content }] })));
+        secure.write(messagesRequest(
+          JSON.stringify({ model: 'claude-opus-4-8', messages: [{ role: 'user', content }] }),
+          path,
+        ));
         await awaitStatus502(secure, () => response);
         const heldMs = Date.now() - sentAt;
         secure.destroy();
@@ -2998,7 +3043,8 @@ describe('selective HTTP proxy', () => {
 
       it('holds a request whose upstream name does not resolve, then answers 502 when the hold is spent', async () => {
         // A simulated DNS outage, hermetic: the injected resolver fails every
-        // lookup, so the host's own resolver cannot change the result.
+        // lookup, so the host's own resolver cannot change the result. The
+        // request carries the `?beta=true` query Claude Code really sends.
         process.env[HOLD_ENV] = '2500';
         const certificates = ensureHttpProxyCertificates();
         const inferenceLogPath = join(testHome, 'passthrough-outage-dns.jsonl');
@@ -3011,7 +3057,12 @@ describe('selective HTTP proxy', () => {
           anthropicLookup: resolver.lookup,
         });
         try {
-          const { response, heldMs } = await heldRequestTo502(proxy.port, certificates.caCert, 'dns');
+          const { response, heldMs } = await heldRequestTo502(
+            proxy.port,
+            certificates.caCert,
+            'dns',
+            '/v1/messages?beta=true',
+          );
 
           // Held for the whole budget rather than failing in milliseconds, and
           // no longer than it.
@@ -3072,7 +3123,9 @@ describe('selective HTTP proxy', () => {
           expect(retried[0]!['retryDelayMs']).toBe(1_000);
           expect(retried[1]!['retryDelayMs']).toBe(2_000);
           expect(retried[2]!['retryDelayMs']).toBeGreaterThan(700);
-          expect(retried[2]!['retryDelayMs']).toBeLessThanOrEqual(1_000);
+          // A few ms over 1 s is possible: the earlier waits can fire a
+          // millisecond early on Node's timer clock, leaving more time to cut to.
+          expect(retried[2]!['retryDelayMs']).toBeLessThanOrEqual(1_050);
         } finally {
           await proxy.close();
         }
@@ -3350,7 +3403,9 @@ describe('selective HTTP proxy', () => {
 
           const late = responses[0]!.slice(before);
           expect(late).toContain('HTTP/1.1 502');
-          expect(late).toContain('outage hold of 1500 ms expired before the TLS handshake completed');
+          // Nothing failed to connect, so the 502 names the late reset, not an outage.
+          expect(late).toContain('reused connection was reset after the outage hold of 1500 ms had expired');
+          expect(late).not.toContain('expired before the TLS handshake completed');
           // Answered as soon as the reset arrived, without waiting on a new connection.
           expect(answeredAt - origin.resetAt()!).toBeLessThan(300);
           // No fresh connection completed TLS: the replay never reached the origin.
@@ -3618,8 +3673,15 @@ describe('selective HTTP proxy', () => {
         try {
           const secure = await connectMitm(proxy.port, certificates.caCert);
           secure.write(messagesRequest(JSON.stringify({ model: 'claude-opus-4-8', messages: [{ role: 'user', content: 'abandon' }] })));
-          // Attempts at 0 and 1 s; the next would be at 3 s, then 7 s.
-          await new Promise(resolve => setTimeout(resolve, 1_500));
+          // Attempts at 0 and 1 s; the next would be at 3 s, then 7 s. Leave once
+          // the second attempt has failed and its 2 s wait has begun, so the
+          // client gives up during a hold wait however slowly the host runs.
+          const retriedSoFar = (): number => (existsSync(inferenceLogPath)
+            ? readFileSync(inferenceLogPath, 'utf8').trim().split('\n')
+              .filter(line => JSON.parse(line)['event'] === 'response_retried').length
+            : 0);
+          await awaitUntil(secure, () => origin.connections() >= 2 && retriedSoFar() >= 2,
+            () => `expected 2 held attempts, saw ${origin.connections()} connections, ${retriedSoFar()} retries`);
           expect(origin.connections()).toBe(2);
           secure.destroy();
           await new Promise(resolve => setTimeout(resolve, 4_500));
