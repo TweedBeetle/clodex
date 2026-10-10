@@ -520,11 +520,12 @@ function forwardRawAnthropicRequest(
 
     // A replay of a reset reused connection that starts after the deadline is
     // cut by the deadline alone, with no connect failure behind it, so its 502
-    // names the reset rather than reporting an outage.
+    // names the reset rather than reporting an outage. Only the replay is timed:
+    // the reset itself may have come just before the deadline.
     const lateReplayDetail = (): string => {
       const parts = [
-        `reused connection was reset after the outage hold of ${outageHoldMs} ms had expired, `
-        + 'so the request was not resent on a new connection',
+        `reused connection was reset and the outage hold of ${outageHoldMs} ms had expired `
+        + 'before the request could be resent, so it was not resent on a new connection',
       ];
       if (lastHoldError) parts.push(`last upstream error: ${upstreamUnreachableDetail(lastHoldError)}`);
       return parts.join('; ');

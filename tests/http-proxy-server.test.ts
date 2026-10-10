@@ -3404,7 +3404,9 @@ describe('selective HTTP proxy', () => {
           const late = responses[0]!.slice(before);
           expect(late).toContain('HTTP/1.1 502');
           // Nothing failed to connect, so the 502 names the late reset, not an outage.
-          expect(late).toContain('reused connection was reset after the outage hold of 1500 ms had expired');
+          expect(late).toContain(
+            'reused connection was reset and the outage hold of 1500 ms had expired before the request could be resent',
+          );
           expect(late).not.toContain('expired before the TLS handshake completed');
           // Answered as soon as the reset arrived, without waiting on a new connection.
           expect(answeredAt - origin.resetAt()!).toBeLessThan(300);
@@ -3427,6 +3429,59 @@ describe('selective HTTP proxy', () => {
         } finally {
           await proxy.close();
           await new Promise<void>(resolve => origin.server.close(() => resolve()));
+        }
+      }, 20_000);
+
+      it('keeps the outage message on a held retry that starts after the deadline', async () => {
+        // A held retry is started only before the deadline, but building its
+        // request can carry it past: the clock is read again after the request
+        // exists. Such an attempt is cut when its socket arrives, like a late
+        // replay, yet it follows an outage, not a reset of a reused connection,
+        // so its 502 must keep saying the outage hold expired. The second lookup
+        // moves the clock past the deadline while the request is being built.
+        process.env[HOLD_ENV] = '1500';
+        const certificates = ensureHttpProxyCertificates();
+        const inferenceLogPath = join(testHome, 'passthrough-outage-late-held-retry.jsonl');
+        const realNow = Date.now.bind(Date);
+        let clockShiftMs = 0;
+        const clock = vi.spyOn(Date, 'now').mockImplementation(() => realNow() + clockShiftMs);
+        let lookups = 0;
+        const lookup = ((
+          hostname: string,
+          _options: unknown,
+          callback: (err: NodeJS.ErrnoException | null, address: string, family: number) => void,
+        ) => {
+          lookups += 1;
+          if (lookups === 2) clockShiftMs = 1_000;
+          const err: NodeJS.ErrnoException = Object.assign(
+            new Error(`getaddrinfo ENOTFOUND ${hostname}`),
+            { code: 'ENOTFOUND', syscall: 'getaddrinfo', hostname },
+          );
+          setTimeout(() => callback(err, '', 0), 50);
+        }) as unknown as net.LookupFunction;
+        const proxy = await startHttpProxy({
+          routes: [],
+          inferenceLogPath,
+          anthropicOrigin: 'https://clodex-outage-test.invalid',
+          anthropicRejectUnauthorized: false,
+          anthropicLookup: lookup,
+        });
+        try {
+          const { response } = await heldRequestTo502(proxy.port, certificates.caCert, 'late held retry');
+
+          expect(lookups).toBe(2);
+          expect(response).toContain('outage hold of 1500 ms expired before the TLS handshake completed');
+          expect(response).toContain('last upstream error: getaddrinfo ENOTFOUND');
+          expect(response).not.toContain('reused connection');
+          const entries = await readLog(inferenceLogPath);
+          expect(entries).toContainEqual(expect.objectContaining({
+            event: 'response_failed',
+            errorType: 'outage_hold_expired',
+            attempt: 2,
+          }));
+        } finally {
+          clock.mockRestore();
+          await proxy.close();
         }
       }, 20_000);
 
@@ -3659,8 +3714,10 @@ describe('selective HTTP proxy', () => {
 
       it('stops retrying when the client gives up during the hold', async () => {
         // Counts connections at the origin, not log lines: an attempt made after
-        // the client left logs nothing, so only the origin can see it.
-        process.env[HOLD_ENV] = '10000';
+        // the client left logs nothing, so only the origin can see it. The hold
+        // is long enough that a slow host still leaves a retry wait to cancel.
+        const holdMs = 30_000;
+        process.env[HOLD_ENV] = String(holdMs);
         const certificates = ensureHttpProxyCertificates();
         const inferenceLogPath = join(testHome, 'passthrough-outage-abandon.jsonl');
         const origin = await rawOrigin(socket => socket.resetAndDestroy());
@@ -3673,22 +3730,35 @@ describe('selective HTTP proxy', () => {
         try {
           const secure = await connectMitm(proxy.port, certificates.caCert);
           secure.write(messagesRequest(JSON.stringify({ model: 'claude-opus-4-8', messages: [{ role: 'user', content: 'abandon' }] })));
-          // Attempts at 0 and 1 s; the next would be at 3 s, then 7 s. Leave once
-          // the second attempt has failed and its 2 s wait has begun, so the
-          // client gives up during a hold wait however slowly the host runs.
-          const retriedSoFar = (): number => (existsSync(inferenceLogPath)
+          // Leave once the second attempt has failed and its wait has begun.
+          const retriedSoFar = (): Record<string, unknown>[] => (existsSync(inferenceLogPath)
             ? readFileSync(inferenceLogPath, 'utf8').trim().split('\n')
-              .filter(line => JSON.parse(line)['event'] === 'response_retried').length
-            : 0);
-          await awaitUntil(secure, () => origin.connections() >= 2 && retriedSoFar() >= 2,
-            () => `expected 2 held attempts, saw ${origin.connections()} connections, ${retriedSoFar()} retries`);
+              .map(line => JSON.parse(line) as Record<string, unknown>)
+              .filter(entry => entry['event'] === 'response_retried')
+            : []);
+          await awaitUntil(secure, () => origin.connections() >= 2 && retriedSoFar().length >= 2,
+            () => `expected 2 held attempts, saw ${origin.connections()} connections, ${retriedSoFar().length} retries`);
+          const pendingWait = retriedSoFar()[1]!;
+          const waitEndsAt = Date.parse(pendingWait['timestamp'] as string) + (pendingWait['retryDelayMs'] as number);
+          // The wait being cancelled must end before the deadline, so the only
+          // thing it can lead to is another attempt, and it must not have ended
+          // yet, so there is still an attempt for the disconnect to prevent.
+          expect((pendingWait['holdElapsedMs'] as number) + (pendingWait['retryDelayMs'] as number))
+            .toBeLessThan(holdMs);
+          expect(Date.now()).toBeLessThan(waitEndsAt);
           expect(origin.connections()).toBe(2);
           secure.destroy();
-          await new Promise(resolve => setTimeout(resolve, 4_500));
+          await new Promise(resolve => setTimeout(resolve, Math.max(0, waitEndsAt - Date.now()) + 1_500));
+
+          // Nothing ran after the disconnect: no new attempt and no 502.
           expect(origin.connections()).toBe(2);
           const entries = await readLog(inferenceLogPath);
+          const disconnectedAt = entries.findIndex(entry => entry['event'] === 'response_client_disconnected');
+          expect(disconnectedAt).toBeGreaterThanOrEqual(0);
+          expect(entries.slice(disconnectedAt + 1)).toEqual([]);
           expect(entries.filter(entry => entry['event'] === 'response_retried')).toHaveLength(2);
-          expect(entries).toContainEqual(expect.objectContaining({ event: 'response_client_disconnected' }));
+          expect(entries.some(entry => entry['event'] === 'response_failed' || entry['statusCode'] === 502))
+            .toBe(false);
         } finally {
           await proxy.close();
           await origin.close();

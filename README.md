@@ -520,11 +520,13 @@ clodex --version    # version
   nothing. When clodex itself uses `HTTPS_PROXY`, the hold covers an
   unreachable proxy and a tunnel that fails before its TLS handshake completes.
   When the proxy is up but Anthropic is not, the proxy usually answers clodex's
-  `CONNECT` with an error status or closes before replying, and the proxy's
-  error response, or clodex's 502 if it closed, comes back at once, as it does
-  with the hold off. A replay after the deadline that needs a new tunnel waits
+  `CONNECT` with an error status, and that error response comes back at once,
+  as it does with the hold off. If the proxy closes the connection before
+  replying, clodex answers 502 at once; if it resets the connection instead,
+  the request is held as for an unreachable proxy. A replay after the deadline that needs a new tunnel waits
   for the proxy's `CONNECT` reply and is not cut while it waits, so a proxy
-  that never replies leaves that request with no response.
+  that never replies leaves that request with no response, and an error reply
+  to it gets clodex's 502 instead of the proxy's.
 - **Connection pacing (ChatGPT/Codex plans):** when many agents run at once,
   clodex spaces out the new connections it opens to OpenAI, which should make a
   burst of parallel work less likely to trip OpenAI's own rate limit. (In the
