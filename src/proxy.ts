@@ -65,6 +65,7 @@ import {
 } from './anthropic-endpoints.js';
 import { withResponsesWebSocketDiagnosticContext } from './oauth/responses-websocket.js';
 import { openCodeGoSessionHeaders } from './data/opencode-go-models.js';
+import { isUnpinnedGoRelayRoute, unpinnedHostOptedIn, unpinnedHostRefusal } from './unpinned-host-guard.js';
 import { resolveContextWindow } from './context-window.js';
 import { listenTcpServer } from './listener-ready.js';
 import type { ModelRuntimeCompatibility } from './model-runtime-compatibility.js';
@@ -540,6 +541,13 @@ export async function startProxyCatalog(
           plog(() => `anthropic token-count error: ${message}`);
           anthropicError(res, 502, message);
         }
+        return;
+      }
+
+      // Local CLX guard: see unpinned-host-guard.ts.
+      if (isUnpinnedGoRelayRoute(route) && !unpinnedHostOptedIn(req)) {
+        plog(() => `unpinned relay refused: route=${route.realModelId}`);
+        anthropicError(res, 400, unpinnedHostRefusal(route.realModelId));
         return;
       }
 

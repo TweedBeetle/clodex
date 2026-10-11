@@ -90,6 +90,8 @@ function post(
           'content-type': 'application/json',
           'anthropic-version': '2023-06-01',
           'content-length': Buffer.byteLength(payload),
+          // Local CLX guard (unpinned-host-guard.ts): these tests exercise the refused route.
+          'x-clx-unpinned-host-ok': '1',
           ...headers,
         },
       },
