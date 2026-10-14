@@ -184,6 +184,17 @@ async function loadSdkProviderFactory(npm: string): Promise<SdkProviderFactory> 
   return cached;
 }
 
+/** Experiential Labs' gateway answers streamed requests with no usage unless asked. */
+function isExperientialBaseUrl(baseURL: string | undefined): boolean {
+  if (!baseURL) return false;
+  try {
+    const host = new URL(baseURL).hostname;
+    return host === 'experientiallabs.ai' || host.endsWith('.experientiallabs.ai');
+  } catch {
+    return false;
+  }
+}
+
 export async function createLanguageModel(spec: ProviderModelSpec): Promise<LanguageModel> {
   const { npm, modelId, apiKey, baseURL } = spec;
   const noAuthFetch = observingFetch(spec.onResponseHeaders, fetchWithoutCredentialHeaders);
@@ -289,18 +300,17 @@ export async function createLanguageModel(spec: ProviderModelSpec): Promise<Lang
     const options = {
       name: spec.providerId ?? 'openai-compatible',
       baseURL: baseURL ?? '',
-      // Ask for usage on streamed responses (stream_options.include_usage).
-      // Without it, servers that follow OpenAI's default (Experiential Labs
-      // measured 2026-10-14) send no usage at all, so input, output and
-      // cache-read counts fall back to estimates and cache hits read as 0.
-      includeUsage: true,
       ...(spec.authType !== 'none' && apiKey.trim() ? { apiKey } : {}),
       ...(spec.authType === 'none' ? { fetch: noAuthFetch } : apiKeyFetch ? { fetch: apiKeyFetch } : {}),
       ...(spec.headers ? { headers: spec.headers } : {}),
       // ollama.com sends a streamed usage chunk only when the request carries
       // stream_options.include_usage (observed 2026-10-13); without it every
       // streamed turn reports output_tokens 0. Scoped to this provider only.
-      ...(spec.providerId === OLLAMA_CLOUD_PROVIDER_ID ? { includeUsage: true } : {}),
+      // Same for Experiential Labs (measured 2026-10-14): with no usage, input, output
+      // and cache-read counts fall back to estimates and real cache hits read as 0.
+      ...(spec.providerId === OLLAMA_CLOUD_PROVIDER_ID || isExperientialBaseUrl(baseURL)
+        ? { includeUsage: true }
+        : {}),
       ...(spec.compatibility
         ? {
             transformRequestBody: (body: Record<string, unknown>) =>

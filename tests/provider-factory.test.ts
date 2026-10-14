@@ -936,6 +936,29 @@ describe('createLanguageModel', () => {
     vi.doUnmock('@ai-sdk/anthropic');
   });
 
+  it('asks Experiential Labs for streamed usage', async () => {
+    const factory = vi.fn((modelId: string) => ({ modelId }));
+    const createOpenAICompatible = vi.fn(() => factory);
+    vi.doMock('@ai-sdk/openai-compatible', () => ({ createOpenAICompatible }));
+
+    const { createLanguageModel: create } = await import('../src/provider-factory.js');
+    await create({
+      npm: '@ai-sdk/openai-compatible',
+      modelId: 'glm-5.3-flash-abliterated',
+      apiKey: 'sk-test',
+      baseURL: 'https://api.experientiallabs.ai/v1',
+      providerId: 'custom-experiential',
+    });
+
+    expect(createOpenAICompatible).toHaveBeenCalledWith({
+      name: 'custom-experiential',
+      apiKey: 'sk-test',
+      baseURL: 'https://api.experientiallabs.ai/v1',
+      includeUsage: true,
+    });
+    vi.doUnmock('@ai-sdk/openai-compatible');
+  });
+
   it('forwards custom headers for openai-compatible custom endpoints', async () => {
     const factory = vi.fn((modelId: string) => ({ modelId }));
     const createOpenAICompatible = vi.fn(() => factory);
@@ -953,7 +976,6 @@ describe('createLanguageModel', () => {
 
     expect(createOpenAICompatible).toHaveBeenCalledWith({
       name: 'custom-zai',
-      includeUsage: true,
       apiKey: 'sk-test',
       baseURL: 'https://api.z.ai/api/coding/paas/v4',
       headers: { 'X-Plan': 'coding' },
@@ -1021,7 +1043,6 @@ describe('createLanguageModel', () => {
 
     expect(createOpenAICompatible).toHaveBeenCalledWith({
       name: 'kilo',
-      includeUsage: true,
       baseURL: 'https://api.kilo.ai/api/gateway',
       fetch: expect.any(Function),
     });
