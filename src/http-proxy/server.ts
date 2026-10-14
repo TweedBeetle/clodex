@@ -1315,10 +1315,12 @@ export async function startHttpProxy(options: HttpProxyOptions): Promise<HttpPro
               + 'This route is for sandbox work only; remove the secret from the context or use another model.';
             process.stderr.write(`[secret-guard] refused request ${requestId} to ${guardProvider}: `
               + (verdict.reason === 'match' ? displaySecretPath(verdict.file) : verdict.detail) + '\n');
-            res.writeHead(403, { 'Content-Type': 'application/json' });
+            // 400, not 403: Claude Code renders a 403 as "Failed to authenticate", which
+            // points people at /login; a 400 invalid_request_error shows the message text.
+            res.writeHead(400, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({
               type: 'error',
-              error: { type: 'permission_error', message },
+              error: { type: 'invalid_request_error', message },
             }));
             return;
           }
