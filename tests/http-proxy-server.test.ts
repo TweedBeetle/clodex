@@ -943,6 +943,80 @@ describe('selective HTTP proxy', () => {
     }
   }, 20_000);
 
+  it('forwards every first-party header unchanged: client identity, auth, betas', async () => {
+    // Anthropic's Usage Policy from 2026-11-12 bans proxies that "misrepresent the product or
+    // client being used". The bridge must hand api.anthropic.com Claude Code's own request: the
+    // same header names, values and order, minus only the proxy's hop-by-hop headers.
+    const certificates = ensureHttpProxyCertificates();
+    let receivedRaw: string[] = [];
+    let receivedBody = Buffer.alloc(0);
+    const origin = https.createServer({
+      key: certificates.serverKey,
+      cert: certificates.serverCert,
+    }, async (req, res) => {
+      receivedRaw = req.rawHeaders.slice();
+      const chunks: Buffer[] = [];
+      req.on('data', chunk => chunks.push(Buffer.from(chunk)));
+      await once(req, 'end');
+      receivedBody = Buffer.concat(chunks);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end('{}');
+    });
+    const originPort = await listen(origin);
+    const proxy = await startHttpProxy({
+      routes: [],
+      anthropicOrigin: `https://127.0.0.1:${originPort}`,
+      anthropicRejectUnauthorized: false,
+    });
+    try {
+      const body = Buffer.from('{"model":"claude-opus-5-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}');
+      const firstParty: [string, string][] = [
+        ['Host', 'api.anthropic.com'],
+        ['Authorization', 'Bearer sk-ant-oat01-subscription-token'],
+        ['User-Agent', 'claude-cli/2.1.299 (external, cli)'],
+        ['x-app', 'cli'],
+        ['anthropic-version', '2023-06-01'],
+        ['anthropic-beta', 'claude-code-20250219,oauth-2025-04-20'],
+        ['anthropic-dangerous-direct-browser-access', 'true'],
+        ['X-Stainless-Lang', 'js'],
+        ['X-Stainless-Package-Version', '0.99.0'],
+        ['x-claude-code-session-id', '00000000-0000-4000-8000-000000000009'],
+        ['Content-Type', 'application/json'],
+        ['Content-Length', String(body.length)],
+      ];
+      const secure = await connectMitm(proxy.port, certificates.caCert);
+      let response = '';
+      secure.on('data', chunk => { response += chunk.toString(); });
+      secure.write([
+        'POST /v1/messages?beta=true HTTP/1.1',
+        ...firstParty.map(([name, value]) => `${name}: ${value}`),
+        'Proxy-Connection: keep-alive',
+        'x-clodex-proxy-hop: 1',
+        'Connection: close',
+        '',
+        '',
+      ].join('\r\n') + body.toString());
+      await once(secure, 'close');
+
+      expect(response).toContain('200 OK');
+      const received: [string, string][] = [];
+      for (let i = 0; i < receivedRaw.length; i += 2) received.push([receivedRaw[i]!, receivedRaw[i + 1]!]);
+      // Every first-party header arrives with its exact name and value, in the client's order.
+      const firstPartyArrived = received.filter(([name]) =>
+        firstParty.some(([sent]) => sent === name));
+      expect(firstPartyArrived).toEqual(firstParty);
+      // Nothing was added beyond transport framing, and the proxy's own headers stayed behind.
+      const extra = received.filter(([name]) =>
+        !firstParty.some(([sent]) => sent === name) && name.toLowerCase() !== 'connection');
+      expect(extra).toEqual([]);
+      expect(received.some(([name]) => /^proxy-|^x-clodex-proxy-hop$/i.test(name))).toBe(false);
+      expect(receivedBody.equals(body)).toBe(true);
+    } finally {
+      await proxy.close();
+      await new Promise<void>(resolve => origin.close(() => resolve()));
+    }
+  });
+
   it('preserves compressed first-party request bytes, encoding, and auth', async () => {
     const certificates = ensureHttpProxyCertificates();
     let receivedBody = Buffer.alloc(0);
