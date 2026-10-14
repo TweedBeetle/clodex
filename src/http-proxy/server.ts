@@ -13,6 +13,7 @@ import { ensureHttpProxyCertificates } from './ca.js';
 import { normalizeRouteLookupId } from '../context-model-id.js';
 import { listenTcpServer } from '../listener-ready.js';
 import { routeUnavailableMessage } from '../route-unavailable.js';
+import { SecretGuard, displaySecretPath } from './secret-guard.js';
 import { emitParentNotice } from '../parent-notice.js';
 import {
   outageRetryDelayMs,
@@ -54,6 +55,8 @@ const MAX_USAGE_SSE_BLOCK_BYTES = 64 * 1024;
  * worth the reach. `errorType` on response_failed records it if it shows up.
  */
 const RETRYABLE_PASSTHROUGH_CODE = 'ECONNRESET';
+// Opt-in via <CLODEX_HOME>/secret-guard.json; inert when that file is absent.
+const secretGuard = new SecretGuard();
 
 /**
  * Failures that mean the request never reached Anthropic: name resolution
@@ -1301,6 +1304,25 @@ export async function startHttpProxy(options: HttpProxyOptions): Promise<HttpPro
       }
 
       if (route && adapter) {
+        const guardProvider = route.providerId ?? route.aliasId.split(':')[1] ?? 'unknown';
+        if (secretGuard.appliesTo(guardProvider)) {
+          const verdict = secretGuard.check(guardProvider, adapterBody);
+          if (!verdict.allowed) {
+            const what = verdict.reason === 'match'
+              ? `the request contains the value of ${displaySecretPath(verdict.file)}`
+              : `the secret guard could not verify the request (${verdict.detail})`;
+            const message = `clodex secret guard: not sent to ${guardProvider}: ${what}. `
+              + 'This route is for sandbox work only; remove the secret from the context or use another model.';
+            process.stderr.write(`[secret-guard] refused request ${requestId} to ${guardProvider}: `
+              + (verdict.reason === 'match' ? displaySecretPath(verdict.file) : verdict.detail) + '\n');
+            res.writeHead(403, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+              type: 'error',
+              error: { type: 'permission_error', message },
+            }));
+            return;
+          }
+        }
         // The adapter resolves alias names itself and must echo the client's
         // requested model id in response messages. Encoded bodies are decoded
         // for this local hop, but their JSON model value is not rewritten.
