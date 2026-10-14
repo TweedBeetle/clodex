@@ -953,6 +953,7 @@ describe('createLanguageModel', () => {
 
     expect(createOpenAICompatible).toHaveBeenCalledWith({
       name: 'custom-zai',
+      includeUsage: true,
       apiKey: 'sk-test',
       baseURL: 'https://api.z.ai/api/coding/paas/v4',
       headers: { 'X-Plan': 'coding' },
@@ -1020,6 +1021,7 @@ describe('createLanguageModel', () => {
 
     expect(createOpenAICompatible).toHaveBeenCalledWith({
       name: 'kilo',
+      includeUsage: true,
       baseURL: 'https://api.kilo.ai/api/gateway',
       fetch: expect.any(Function),
     });

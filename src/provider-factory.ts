@@ -289,6 +289,11 @@ export async function createLanguageModel(spec: ProviderModelSpec): Promise<Lang
     const options = {
       name: spec.providerId ?? 'openai-compatible',
       baseURL: baseURL ?? '',
+      // Ask for usage on streamed responses (stream_options.include_usage).
+      // Without it, servers that follow OpenAI's default (Experiential Labs
+      // measured 2026-10-14) send no usage at all, so input, output and
+      // cache-read counts fall back to estimates and cache hits read as 0.
+      includeUsage: true,
       ...(spec.authType !== 'none' && apiKey.trim() ? { apiKey } : {}),
       ...(spec.authType === 'none' ? { fetch: noAuthFetch } : apiKeyFetch ? { fetch: apiKeyFetch } : {}),
       ...(spec.headers ? { headers: spec.headers } : {}),
