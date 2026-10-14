@@ -21,8 +21,16 @@
 //
 // Fail closed: if the config exists but cannot be parsed, or a watched file cannot be
 // read, requests to listed providers are refused until it can.
+//
+// Sandbox-only providers (optional): `"sandboxOnly": [...]` names providers that may be
+// used only by requests arriving through a tunnel opened by the cc-sandbox egress
+// gateway. The gateway proves itself by sending the content of `"sandboxTokenFile"` in
+// an `X-Clx-Sandbox` header on its CONNECT; the file lives where the sandbox cannot read
+// it. A missing or empty token file means no tunnel qualifies, so those providers are
+// refused everywhere until it exists.
 
 import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs';
+import { timingSafeEqual } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { getAppHome } from '../paths.js';
@@ -31,6 +39,8 @@ export interface SecretGuardConfig {
   providers: string[];
   paths: string[];
   minLength?: number;
+  sandboxOnly?: string[];
+  sandboxTokenFile?: string;
 }
 
 export type SecretGuardVerdict =
@@ -140,6 +150,29 @@ export class SecretGuard {
     return { allowed: true };
   }
 
+  /** Whether this provider may only be reached through a cc-sandbox tunnel. */
+  sandboxOnly(provider: string): boolean {
+    this.refresh(true);
+    return this.config?.sandboxOnly?.includes(provider) ?? false;
+  }
+
+  /** Whether a CONNECT's X-Clx-Sandbox value is the configured sandbox token. */
+  isSandboxToken(value: string | undefined): boolean {
+    this.refresh(true);
+    const file = this.config?.sandboxTokenFile;
+    if (!value || !file) return false;
+    let token: string;
+    try {
+      token = readFileSync(expandHome(file, this.home), 'utf8').trim();
+    } catch {
+      return false;
+    }
+    if (token.length < 16) return false;
+    const a = Buffer.from(value.trim());
+    const b = Buffer.from(token);
+    return a.length === b.length && timingSafeEqual(a, b);
+  }
+
   /** Number of watched files and values, for diagnostics. */
   stats(): { files: number; values: number } {
     this.refresh(false);
@@ -169,6 +202,9 @@ export class SecretGuard {
           const parsed = JSON.parse(readFileSync(this.configPath, 'utf8')) as SecretGuardConfig;
           if (!Array.isArray(parsed.providers) || !Array.isArray(parsed.paths)) {
             throw new Error('needs "providers" and "paths" arrays');
+          }
+          if (parsed.sandboxOnly !== undefined && !Array.isArray(parsed.sandboxOnly)) {
+            throw new Error('"sandboxOnly" must be an array');
           }
           this.config = parsed;
           this.configError = null;

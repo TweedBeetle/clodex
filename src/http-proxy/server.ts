@@ -57,6 +57,11 @@ const MAX_USAGE_SSE_BLOCK_BYTES = 64 * 1024;
 const RETRYABLE_PASSTHROUGH_CODE = 'ECONNRESET';
 // Opt-in via <CLODEX_HOME>/secret-guard.json; inert when that file is absent.
 const secretGuard = new SecretGuard();
+// Tunnels opened by the cc-sandbox egress gateway (CONNECT carried the sandbox token),
+// keyed by the client end's address and port, which the MITM'd TLS socket reports too.
+const sandboxTunnels = new Set<string>();
+const tunnelKey = (socket: { remoteAddress?: string; remotePort?: number }): string =>
+  `${socket.remoteAddress ?? ''}:${socket.remotePort ?? ''}`;
 
 /**
  * Failures that mean the request never reached Anthropic: name resolution
@@ -1305,6 +1310,14 @@ export async function startHttpProxy(options: HttpProxyOptions): Promise<HttpPro
 
       if (route && adapter) {
         const guardProvider = route.providerId ?? route.aliasId.split(':')[1] ?? 'unknown';
+        if (secretGuard.sandboxOnly(guardProvider) && !sandboxTunnels.has(tunnelKey(req.socket))) {
+          const message = `clodex: ${guardProvider} is for sandbox sessions only (non-ZDR or abliterated). `
+            + 'Start one with `cc-sandbox --model <alias> --ws <name>`, or use glm-zdr or another model here.';
+          process.stderr.write(`[sandbox-only] refused request ${requestId} to ${guardProvider}: not a cc-sandbox tunnel\n`);
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message } }));
+          return;
+        }
         if (secretGuard.appliesTo(guardProvider)) {
           const verdict = secretGuard.check(guardProvider, adapterBody);
           if (!verdict.allowed) {
@@ -1471,6 +1484,12 @@ export async function startHttpProxy(options: HttpProxyOptions): Promise<HttpPro
     };
     if (shouldInterceptConnect(req.url ?? '')) {
       if (ownHop && anthropicViaProxy) { rejectOwnHop(); return; }
+      const marker = req.headers['x-clx-sandbox'];
+      if (typeof marker === 'string' && secretGuard.isSandboxToken(marker)) {
+        const key = tunnelKey(clientSocket as net.Socket);
+        sandboxTunnels.add(key);
+        clientSocket.once('close', () => sandboxTunnels.delete(key));
+      }
       clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
       if (head.length > 0) clientSocket.unshift(head);
       mitmServer.emit('connection', clientSocket);
