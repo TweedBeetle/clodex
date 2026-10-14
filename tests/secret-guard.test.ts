@@ -116,3 +116,51 @@ describe('secret guard', () => {
     t.cleanup();
   });
 });
+
+describe('sandbox-only providers', () => {
+  const TOKEN = 'sbx-token-0123456789abcdef0123';
+  const withToken = (t: ReturnType<typeof setup>, token = TOKEN) => {
+    writeFileSync(join(t.home, 'sandbox-token'), token + '\n');
+  };
+
+  it('lists sandbox-only providers and leaves others alone', () => {
+    const t = setup({ ...CONFIG, sandboxOnly: ['custom-experiential'], sandboxTokenFile: '~/sandbox-token' });
+    try {
+      expect(t.guard.sandboxOnly('custom-experiential')).toBe(true);
+      expect(t.guard.sandboxOnly('custom-openrouter-zdr')).toBe(false);
+    } finally { t.cleanup(); }
+  });
+
+  it('accepts only the exact token from the file', () => {
+    const t = setup({ ...CONFIG, sandboxOnly: ['custom-experiential'], sandboxTokenFile: '~/sandbox-token' });
+    try {
+      withToken(t);
+      expect(t.guard.isSandboxToken(TOKEN)).toBe(true);
+      expect(t.guard.isSandboxToken(TOKEN.slice(0, -1))).toBe(false);
+      expect(t.guard.isSandboxToken(TOKEN + 'x')).toBe(false);
+      expect(t.guard.isSandboxToken('')).toBe(false);
+      expect(t.guard.isSandboxToken(undefined)).toBe(false);
+    } finally { t.cleanup(); }
+  });
+
+  it('accepts no token when the file is missing, too short, or not configured', () => {
+    const t = setup({ ...CONFIG, sandboxOnly: ['custom-experiential'], sandboxTokenFile: '~/sandbox-token' });
+    try {
+      expect(t.guard.isSandboxToken(TOKEN)).toBe(false);
+      withToken(t, 'short');
+      expect(t.guard.isSandboxToken('short')).toBe(false);
+    } finally { t.cleanup(); }
+    const u = setup({ ...CONFIG, sandboxOnly: ['custom-experiential'] });
+    try {
+      withToken(u);
+      expect(u.guard.isSandboxToken(TOKEN)).toBe(false);
+    } finally { u.cleanup(); }
+  });
+
+  it('fails closed on a malformed sandboxOnly', () => {
+    const t = setup({ ...CONFIG, sandboxOnly: 'custom-experiential' });
+    try {
+      expect(t.guard.check('custom-experiential', body('hello'))).toMatchObject({ allowed: false, reason: 'guard-error' });
+    } finally { t.cleanup(); }
+  });
+});
