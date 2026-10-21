@@ -803,7 +803,7 @@ describe('registry/refresh-models', () => {
 
     const savedRegistry = vi.mocked(io.saveRegistry).mock.calls[0]?.[0] as ProviderRegistry;
     const savedModel = savedRegistry.providers[0]?.modelsCache?.models[0];
-    expect(result).toMatchObject({ ok: true, modelCount: 1 });
+    expect(result).toMatchObject({ ok: true, modelCount: 2 });
     expect(savedModel?.cost).toEqual({ input: 0.66, output: 1.98, cache_read: 0.022 });
     expect(pricing.enrichModelsWithPricing).not.toHaveBeenCalled();
   });

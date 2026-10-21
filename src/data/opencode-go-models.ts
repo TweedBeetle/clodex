@@ -7,6 +7,14 @@ export const OPENCODE_GO_PROVIDER_NAME = 'OpenCode Go';
 export const OPENCODE_GO_COMPLETIONS_BASE_URL = 'https://opencode.ai/zen/go/v1';
 export const OPENCODE_GO_ANTHROPIC_BASE_URL = 'https://opencode.ai/zen/go';
 export const OPENCODE_GO_SOURCE = 'https://models.dev/api.json';
+/**
+ * Ids Go serves but leaves out of its `/v1/models` list. Discovery keeps only
+ * listed ids, so these are added to what the endpoint returned before the
+ * catalog allowlist is applied; each must also have a catalog entry.
+ * `deepseek-flash` is DeepSeek's moving name for the current V4.1 Flash
+ * snapshot (served by Go, unlisted, measured 2026-10-21).
+ */
+export const OPENCODE_GO_UNLISTED_MODEL_IDS: readonly string[] = ['deepseek-flash'];
 export const OPENCODE_GO_SOURCE_FETCHED_AT = '2026-09-29T18:10:26.407Z';
 
 type OpenCodeGoModel = Pick<CachedModel, 'id' | 'name'>

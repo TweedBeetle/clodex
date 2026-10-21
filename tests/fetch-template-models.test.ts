@@ -351,7 +351,13 @@ describe('fetchTemplateModels', () => {
     const result = await fetchTemplateModels(openCodeGo, 'go-key');
 
     expect(result.error).toBeUndefined();
-    expect(result.models.map(model => model.id)).toEqual(['qwen3.8-max', 'deepseek-v4-pro']);
+    // deepseek-flash is served but unlisted (OPENCODE_GO_UNLISTED_MODEL_IDS), so it is added.
+    expect(result.models.map(model => model.id)).toEqual(['qwen3.8-max', 'deepseek-v4-pro', 'deepseek-flash']);
+    expect(result.models[2]).toMatchObject({
+      modelFormat: 'anthropic',
+      apiUrl: 'https://opencode.ai/zen/go',
+      upstreamModelId: 'deepseek-flash',
+    });
     expect(result.models[0]).toMatchObject({
       modelFormat: 'anthropic',
       npm: '@ai-sdk/anthropic',
@@ -525,7 +531,7 @@ describe('fetchTemplateModels fixed OpenCode Go destination', () => {
       vi.mocked(fetch).mockClear();
       const result = await fetchTemplateModels(openCodeGo(), 'go-key', override);
       expect(result.error, `override=${override}`).toBeUndefined();
-      expect(result.models.map(m => m.id)).toEqual(['deepseek-v4-pro']);
+      expect(result.models.map(m => m.id)).toEqual(['deepseek-v4-pro', 'deepseek-flash']);
       expect(fetch).toHaveBeenCalledWith(
         'https://opencode.ai/zen/go/v1/models',
         expect.objectContaining({
@@ -556,7 +562,7 @@ describe('fetchTemplateModels fixed OpenCode Go destination', () => {
     );
 
     expect(result.error).toBeUndefined();
-    expect(result.models.map(model => model.id)).toEqual(['qwen3.8-max']);
+    expect(result.models.map(model => model.id)).toEqual(['qwen3.8-max', 'deepseek-flash']);
     expect(result.models[0]).toMatchObject({
       name: 'Qwen3.8 Max',
       modelFormat: 'anthropic',

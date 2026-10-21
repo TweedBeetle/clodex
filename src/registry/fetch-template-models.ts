@@ -1,7 +1,7 @@
 // src/registry/fetch-template-models.ts — test connection and list models for template providers
 
 import { TEST_TIMEOUT_MS } from '../constants.js';
-import { OPENCODE_GO_PROVIDER_ID } from '../data/opencode-go-models.js';
+import { OPENCODE_GO_PROVIDER_ID, OPENCODE_GO_UNLISTED_MODEL_IDS } from '../data/opencode-go-models.js';
 import { openAiPricingMetadata } from '../data/openai-oauth-models.js';
 import { deriveBrand } from '../models.js';
 import { lookupKnownContextWindow } from '../context-window.js';
@@ -414,6 +414,13 @@ export async function fetchTemplateModels(
       template.npm,
       template.id === OPENCODE_GO_PROVIDER_ID,
     );
+    if (template.id === OPENCODE_GO_PROVIDER_ID) {
+      const listed = new Set(discovered.map(model => model.id));
+      const unlisted = OPENCODE_GO_UNLISTED_MODEL_IDS.filter(id => !listed.has(id));
+      if (unlisted.length > 0) {
+        discovered.push(...parseModelList(unlisted.map(id => ({ id })), template.npm, true));
+      }
+    }
     const models = applyTemplateModelMetadata(template, discovered);
     if (models.length === 0) {
       // An allowlist template can end up empty for two very different reasons,
