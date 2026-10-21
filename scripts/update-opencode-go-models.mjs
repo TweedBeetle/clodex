@@ -38,6 +38,14 @@ const ANTHROPIC_BASE_URL = 'https://opencode.ai/zen/go';
 // verified; grok and GPT ids other than the two Lunas are still unmapped.
 // One entry (deepseek-v4.1-flash) is taken from OpenCode's per-model Go
 // endpoint table rather than a live probe; its comment says so.
+// Ids Go serves that models.dev does not publish, generated from the metadata
+// of a published sibling with the same price and window. The sibling must
+// exist on models.dev; a vanished sibling fails the update rather than
+// shipping a guessed entry.
+const UNPUBLISHED = Object.assign(Object.create(null), {
+  'deepseek-flash': { from: 'deepseek-v4.1-flash', name: 'DeepSeek Flash (current snapshot)' },
+});
+
 const TRANSPORTS = Object.assign(Object.create(null), {
   'deepseek-v4-flash': 'openai-completions',
   // OpenCode's Go docs (go.mdx endpoint table) list V4.1 Flash on
@@ -47,6 +55,13 @@ const TRANSPORTS = Object.assign(Object.create(null), {
   // probe that answers there: one did, and that route was later reported
   // failing every request with 422 "Endpoint is unavailable" (#308).
   'deepseek-v4.1-flash': 'openai-completions',
+  // `deepseek-flash` is DeepSeek's moving name for the current V4.1 Flash
+  // snapshot (the 1017 build since 2026-10-17). Go serves it but models.dev
+  // does not publish it (UNPUBLISHED below). Measured 2026-10-21: 200 with a
+  // tool_use turn on /v1/messages, and on 2026-10-11 that route reached
+  // DeepSeek's own endpoint (`deepseek.an`) 8 of 8, where completions went to
+  // relays (Novita, OrcaRouter, Luminal). This is the route cc-zen uses daily.
+  'deepseek-flash': 'anthropic-messages',
   'deepseek-v4-pro': 'openai-completions',
   'glm-5.2': 'openai-completions',
   'gpt-5.6-luna': 'openai-completions',
@@ -416,9 +431,17 @@ async function prepareSourceConstant(fetchedAt) {
 async function main() {
   const catalog = await fetchJson(MODELS_DEV_URL);
   const provider = catalog?.[PROVIDER_ID];
-  const devModels = provider?.models;
-  if (!devModels || typeof devModels !== 'object') {
+  const publishedModels = provider?.models;
+  if (!publishedModels || typeof publishedModels !== 'object') {
     throw new Error(`models.dev catalog has no "${PROVIDER_ID}" provider models`);
+  }
+  const devModels = { ...publishedModels };
+  for (const [id, { from, name }] of Object.entries(UNPUBLISHED)) {
+    if (Object.hasOwn(publishedModels, id)) continue; // published now: use the real entry
+    if (!Object.hasOwn(publishedModels, from)) {
+      throw new Error(`${id} is generated from ${from}, which models.dev no longer publishes`);
+    }
+    devModels[id] = { ...publishedModels[from], id, name };
   }
 
   const supported = [];

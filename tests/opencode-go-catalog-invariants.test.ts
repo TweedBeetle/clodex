@@ -149,7 +149,13 @@ describe('opencode-go catalog invariants', () => {
       const regenerated = JSON.parse(
         readFileSync(join(workspace, 'src', 'data', 'opencode-go-models.json'), 'utf8'),
       ) as Array<{ id: string }>;
-      expect(regenerated.map(model => model.id).sort()).toEqual([...mappedIds].sort());
+      // deepseek-flash is generated from deepseek-v4.1-flash (UNPUBLISHED), on the Messages route.
+      expect(regenerated.map(model => model.id).sort()).toEqual([...mappedIds, 'deepseek-flash'].sort());
+      const current = regenerated.find(model => model.id === 'deepseek-flash');
+      expect(current).toMatchObject({
+        modelFormat: 'anthropic', apiUrl: 'https://opencode.ai/zen/go', upstreamModelId: 'deepseek-flash',
+        contextWindow: 128_000,
+      });
       // Pricing boundaries and effort maps are local-only: the fixture feed carries
       // neither a price tier nor a Go-specific map, so both must come from the script.
       const withBoundary = (regenerated as Array<{ id: string; pricingBoundary?: number }>)

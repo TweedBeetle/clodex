@@ -1,5 +1,29 @@
 [
   {
+    "id": "deepseek-flash",
+    "name": "DeepSeek Flash (current snapshot)",
+    "contextWindow": 1000000,
+    "cost": {
+      "input": 0.15,
+      "output": 0.6,
+      "cache_read": 0.003
+    },
+    "modelFormat": "anthropic",
+    "npm": "@ai-sdk/anthropic",
+    "apiUrl": "https://opencode.ai/zen/go",
+    "reasoning": true,
+    "modalities": [
+      "text",
+      "image"
+    ],
+    "compatibility": {
+      "supportsCountTokens": false,
+      "supportsReasoningEffort": false
+    },
+    "upstreamModelId": "deepseek-flash",
+    "family": "deepseek"
+  },
+  {
     "id": "deepseek-v4-flash",
     "name": "DeepSeek V4 Flash",
     "contextWindow": 1000000,
